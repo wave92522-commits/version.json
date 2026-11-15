@@ -27,7 +27,7 @@ local CFG = {
     File = "sm1ler_data.json",
     HubApi = "https://scriptblox.com/api/script/",
     MaxLoad = 3.5,               -- loading screen never lasts longer than this (seconds)
-    Version = "1.2.0",           -- bump this on every release (and in version.json on your host)
+    Version = "1.9.0",           -- bump this on every release (and in version.json on your host)
     Update = {
         ManifestUrl = "https://raw.githubusercontent.com/wave92522-commits/version.json/main/version.json",        -- e.g. https://raw.githubusercontent.com/<you>/<repo>/main/version.json  (empty = updater off)
         ScriptUrl = "",          -- optional fallback if version.json has no "url"
@@ -47,8 +47,59 @@ local CFG = {
         -- Keys are signed with it; a different salt = old keys stop working.
         Salt = "sm1ler-change-this-salt-7Hq2",
     },
+    -- Status: shown on Home and sent to Discord. "status" = the injector itself; "detect" = ban/detection risk.
+    -- Edit these two lines by hand for a quick manual update, or host the same two fields in version.json
+    -- ("status" / "detectStatus") so you can change them without editing or re-publishing the script.
+    Status = {
+        Status = "ok",         -- "ok" | "updating" | "down"
+        Detect = "ok",         -- "ok" | "updating" | "down"
+        -- edit these three lines to change what each state shows - anywhere in the UI and in Discord
+        Icons = { ok = "🟢", updating = "🟡", down = "🔴" },
+        Labels = { ok = { "Work", "Работает" }, updating = { "Updating", "Обновляется" }, down = { "DOWN", "Не работает" } },
+    },
+    -- AI tab: needs the person's own, free API key (Google AI Studio -> "Get API key", or Groq console).
+    -- Leave ApiKey empty here and let people paste their own key in Settings > AI instead (saved per person, DB.ai.key).
+    AI = {
+        Provider = "gemini",   -- "gemini" | "groq"
+        ApiKey = "",
+        Model = "gemini-2.5-flash",
+        GroqModel = "llama-3.3-70b-versatile",
+        Endpoint = "https://generativelanguage.googleapis.com/v1beta/models/",
+        GroqEndpoint = "https://api.groq.com/openai/v1/chat/completions",
+        System = "You are a helpful assistant inside a Roblox script hub. Keep answers short and plain.",
+    },
+    -- Discord: posts an embed to a webhook on inject / failure. Leave WebhookUrl empty to turn this off.
+    Discord = {
+        WebhookUrl = "",             -- https://discord.com/api/webhooks/.../...
+        SendOnInject = true,
+        SendOnFail = true,
+        AvatarUrl = "",
+    },
 }
 
+local function netGet(url)
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and type(body) == "string" and #body > 0 then return body end
+    local req = request or http_request or (syn and syn.request)
+    if req then
+        local ok2, r = pcall(req, { Url = url, Method = "GET" })
+        if ok2 and type(r) == "table" and r.StatusCode == 200 and type(r.Body) == "string" and #r.Body > 0 then return r.Body end
+    end
+    return nil
+end
+local function netPost(url, jsonBody)
+    local req = request or http_request or (syn and syn.request)
+    if req then
+        local ok, r = pcall(req, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = jsonBody })
+        if ok and type(r) == "table" and (r.StatusCode or 0) < 300 then return true end
+    end
+    local ok2 = pcall(function()
+        return game:HttpPost(url, jsonBody, Enum.HttpContentType.ApplicationJson)
+    end)
+    return ok2
+end
+
+local UPD, STAT, DISC, BD   -- forward-declared: assigned further down, used by code defined earlier (doInject, Home, Settings)
 local genv = (getgenv and getgenv()) or _G
 if genv.__SM1LER then pcall(genv.__SM1LER) end
 local conns, alive = {}, true
@@ -77,12 +128,15 @@ DB.recent = DB.recent or {}
 local DEFAULTS = {
     uiSize = 100, font = 13, lang = "en", pos = "Center", blur = true, anim = true,
     notif = true, streamer = false, topbtn = true, drag = false, afk = false, fps = "60", tour = false,
-    snow = true, neon = true, lastPage = "Home",
+    snow = false, neon = true, lastPage = "Home",
     autoInject = false, autoExec = false, autoDelay = 1, outMode = "Auto", spamInterval = 0.5, spamCount = 50, spamBurst = 1, spamStopOnError = true,
-    hud = true, hudSnow = true, hud24h = true, guiStyle = "sm1ler",
+    hud = true, hudSnow = false, hud24h = true, guiStyle = "sm1ler",
+    backdoorScan = false,
 }
 local S = DB.settings
 for k, v in pairs(DEFAULTS) do if S[k] == nil then S[k] = v end end
+if not S.winStyleMig then S.guiStyle, S.winStyleMig = "win", true end   -- Volt-style window buttons
+if not S.noSnowMig then S.snow, S.hudSnow, S.noSnowMig = false, false, true end   -- snow is off by default now
 
 
 if not DB.scripts then
@@ -202,6 +256,226 @@ end
 ----------------------------------------------------------------------
 local FX = { neon = {}, snow = {} }
 local function G(en, ru) return S.lang == "ru" and ru or en end
+
+----------------------------------------------------------------------
+UPD = {}
+do
+    local U = CFG.Update
+    local function vparts(v)
+        local t = {}
+        for n in string.gmatch(tostring(v or "0"), "%d+") do t[#t + 1] = tonumber(n) end
+        return t
+    end
+    function UPD.newer(a, b)
+        local x, y = vparts(a), vparts(b)
+        for i = 1, math.max(#x, #y) do
+            local p, q = x[i] or 0, y[i] or 0
+            if p ~= q then return p > q end
+        end
+        return false
+    end
+    local function path(n) return U.Folder .. "/" .. n end
+    local function filesOk() return (writefile and readfile and isfile) and true or false end
+    local httpGet = netGet
+    function UPD.enabled() return type(U.ManifestUrl) == "string" and U.ManifestUrl ~= "" end
+    -- raw manifest table (adds status / changelog on top of version / url)
+    function UPD.manifest()
+        if not UPD.enabled() then return nil end
+        local sep = string.find(U.ManifestUrl, "?", 1, true) and "&" or "?"
+        local body = httpGet(U.ManifestUrl .. sep .. "t=" .. os.time())
+        if not body then return nil end
+        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+        return (ok and type(data) == "table") and data or nil
+    end
+
+    -- saved build: returns version, source
+    function UPD.cached()
+        if not filesOk() then return nil end
+        local ok, v, src = pcall(function()
+            if isfile(path("version.txt")) and isfile(path("client.lua")) then
+                return (string.gsub(readfile(path("version.txt")), "%s+", "")), readfile(path("client.lua"))
+            end
+        end)
+        if ok and type(v) == "string" and v ~= "" and type(src) == "string" and #src > 1000 then return v, src end
+        return nil
+    end
+
+    function UPD.remote()
+        local data = UPD.manifest()
+        if data and data.version and ((data.url and data.url ~= "") or U.ScriptUrl ~= "") then
+            return { version = tostring(data.version), url = (data.url and data.url ~= "") and data.url or U.ScriptUrl }
+        end
+        return nil
+    end
+
+    -- downloads a build and saves it; returns ok, source
+    function UPD.install(m, cb)
+        cb = cb or function() end
+        cb(0.1)
+        local src = httpGet(m.url)
+        cb(0.8)
+        if not src or #src < 1000 then return false end
+        local okc, fn = pcall(function() return loadstring(src) end)
+        if not okc or type(fn) ~= "function" then return false end   -- corrupt / 404 page: never save it
+        if filesOk() then
+            pcall(function()
+                if makefolder and isfolder and not isfolder(U.Folder) then makefolder(U.Folder) end
+                writefile(path("client.lua"), src)
+                writefile(path("version.txt"), m.version)
+            end)
+        end
+        cb(1)
+        return true, src
+    end
+
+    -- makes sure the injector data exists locally (downloads only when missing)
+    function UPD.ensure(progress)
+        progress = progress or function() end
+        progress(0.05, G("Checking components", "Проверка компонентов"))
+        if not UPD.enabled() or not filesOk() then
+            progress(1, G("Components ready", "Компоненты готовы"))
+            return true
+        end
+        if UPD.cached() then
+            progress(1, G("Components ready", "Компоненты готовы"))
+            return true
+        end
+        progress(0.2, G("Contacting server", "Подключение к серверу"))
+        local m = UPD.remote()
+        if not m then
+            progress(1, G("Server unreachable, will retry later", "Сервер недоступен, повторю позже"))
+            return false
+        end
+        local ok = UPD.install(m, function(p) progress(0.2 + 0.75 * p, G("Downloading injector data", "Загрузка данных инжектора")) end)
+        progress(1, ok and G("Components ready", "Компоненты готовы") or G("Download failed, will retry later", "Загрузка не удалась, повторю позже"))
+        return ok and true or false
+    end
+
+    function UPD.launch(src, ver)
+        local okc, fn = pcall(function() return loadstring(src) end)
+        if not okc or type(fn) ~= "function" then return false end
+        genv.__SM1LER_launched = ver
+        task.spawn(fn)   -- the new build tears this one down at its very top
+        return true
+    end
+
+    -- called at boot: returns true when a newer build was started (this instance must stop)
+    function UPD.boot(cb)
+        genv.__SM1LER_upd_n = genv.__SM1LER_upd_n or 0
+        if genv.__SM1LER_upd_n >= 3 then return false end   -- loop guard
+        cb(G("Checking for updates", "Проверка обновлений"), 0.2)
+        local cv, csrc = UPD.cached()
+        local newestLocal = (cv and UPD.newer(cv, CFG.Version)) and cv or CFG.Version
+        local m = UPD.enabled() and UPD.remote() or nil
+        if m and UPD.newer(m.version, newestLocal) then
+            genv.__SM1LER_upd_n = genv.__SM1LER_upd_n + 1
+            cb(G("Downloading update ", "Загрузка обновления ") .. m.version, 0.4)
+            local ok, src = UPD.install(m, function(p) cb(G("Downloading update ", "Загрузка обновления ") .. m.version, 0.4 + 0.5 * p) end)
+            if ok then
+                cb(G("Starting version ", "Запуск версии ") .. m.version, 1)
+                if UPD.launch(src, m.version) then return true end
+            end
+        elseif cv and UPD.newer(cv, CFG.Version) then
+            genv.__SM1LER_upd_n = genv.__SM1LER_upd_n + 1
+            cb(G("Starting version ", "Запуск версии ") .. cv, 1)
+            if UPD.launch(csrc, cv) then return true end
+        end
+        return false
+    end
+end
+
+
+----------------------------------------------------------------------
+-- STATUS: injector / detection status (own CFG values, or overridden by version.json),
+-- changelog, and a Discord webhook that posts both whenever the injector connects.
+----------------------------------------------------------------------
+STAT = { status = CFG.Status.Status, detect = CFG.Status.Detect, changelog = {}, listeners = {} }
+function STAT.icon(key) return CFG.Status.Icons[key] or CFG.Status.Icons.ok end
+function STAT.label(key) local l = CFG.Status.Labels[key] return l and G(l[1], l[2]) or key end
+function STAT.refresh()
+    local m = UPD.manifest()
+    if type(m) == "table" then
+        if type(m.status) == "string" and CFG.Status.Icons[m.status] then STAT.status = m.status end
+        if type(m.detectStatus) == "string" and CFG.Status.Icons[m.detectStatus] then STAT.detect = m.detectStatus end
+        if type(m.changelog) == "table" then STAT.changelog = m.changelog end
+    end
+    for _, f in ipairs(STAT.listeners) do pcall(f) end
+end
+
+----------------------------------------------------------------------
+-- DISCORD: posts an embed with the injector's name, status, detect status and version
+-- to a webhook (Settings > Advanced, or CFG.Discord.WebhookUrl). No personal data is sent.
+----------------------------------------------------------------------
+DISC = {}
+function DISC.enabled() return type(CFG.Discord.WebhookUrl) == "string" and string.find(CFG.Discord.WebhookUrl, "^https?://") ~= nil end
+function DISC.post(event)
+    if not DISC.enabled() then return end
+    task.spawn(function()
+        local color = STAT.status == "ok" and 0x2ECC71 or (STAT.status == "updating" and 0xF1C40F or 0xE74C3C)
+        local desc = STAT.icon(STAT.status) .. " " .. G("Status: ", "Статус: ") .. STAT.label(STAT.status) .. "\n"
+            .. STAT.icon(STAT.detect) .. " " .. G("Detection: ", "Детект: ") .. STAT.label(STAT.detect)
+        local embed = {
+            title = CFG.Name .. " · v" .. CFG.Version,
+            description = desc,
+            color = color,
+            fields = { { name = G("Event", "Событие"), value = tostring(event), inline = true }, { name = "Executor", value = "unknown", inline = true } },
+            footer = { text = os.date("%Y-%m-%d %H:%M:%S") },
+        }
+        pcall(function()
+            local ex = "unknown"
+            if identifyexecutor then local ok, n = pcall(identifyexecutor) if ok then ex = tostring(n) end end
+            embed.fields[2].value = ex
+        end)
+        local payload = { username = CFG.Name, avatar_url = (CFG.Discord.AvatarUrl ~= "" and CFG.Discord.AvatarUrl) or nil, embeds = { embed } }
+        local ok, json = pcall(function() return HttpService:JSONEncode(payload) end)
+        if ok then netPost(CFG.Discord.WebhookUrl, json) end
+    end)
+end
+
+----------------------------------------------------------------------
+-- BACKDOOR MODE: a heuristic, metadata-only scan of the live game for suspicious
+-- instance names / exposed webhook-looking strings. This is NOT a real antivirus:
+-- it cannot read the source of scripts it did not inject, only names and values
+-- it can already see. Treat a hit as "worth a manual look", not proof of a backdoor.
+----------------------------------------------------------------------
+BD = {}
+do
+    local SUS_NAMES = { "backdoor", "rce", "exploit", "grab", "hwid", "crash", "kill_all", "killall", "infect", "payload", "dupe", "ban_", "banall" }
+    local WEBHOOK_PAT = "discordapp%.com/api/webhooks"
+    local WEBHOOK_PAT2 = "discord%.com/api/webhooks"
+    local function suspicious(name)
+        local low = string.lower(name)
+        for _, w in ipairs(SUS_NAMES) do if string.find(low, w, 1, true) then return "name:" .. w end end
+        return nil
+    end
+    function BD.scan(progress)
+        progress = progress or function() end
+        local hits, scanned, roots = {}, 0, { workspace, game:GetService("ReplicatedStorage"), game:GetService("Lighting"), game:GetService("StarterGui"), game:GetService("StarterPack") }
+        for ri, root in ipairs(roots) do
+            progress((ri - 1) / #roots)
+            local ok, desc = pcall(function() return root:GetDescendants() end)
+            if ok then
+                for _, d in ipairs(desc) do
+                    scanned = scanned + 1
+                    if scanned % 400 == 0 then task.wait() end
+                    local why = suspicious(d.Name)
+                    if why then hits[#hits + 1] = { path = d:GetFullName(), why = why } end
+                    if d:IsA("StringValue") or d:IsA("ModuleScript") then
+                        local ok2, v = pcall(function() return d:IsA("StringValue") and d.Value or nil end)
+                        if ok2 and type(v) == "string" and (string.find(v, WEBHOOK_PAT) or string.find(v, WEBHOOK_PAT2)) then
+                            hits[#hits + 1] = { path = d:GetFullName(), why = "webhook string" }
+                        end
+                    end
+                    if #hits > 60 then break end
+                end
+            end
+            if #hits > 60 then break end
+        end
+        progress(1)
+        return hits, scanned
+    end
+end
+
 local function hexToColor(h)
     h = string.gsub(tostring(h or ""), "#", "")
     if #h ~= 6 then return nil end
@@ -213,9 +487,29 @@ local TD = {   -- theme defaults
     mode = "none", color = "#0a0a0c", g1 = "#000000", g2 = "#10102a", g3 = "", angle = 90,
     image = "", imgScale = "Crop", imgAlpha = 0.25, dim = 0.35, panelAlpha = 0,
     neonA = "#ffffff", neonB = "#ffffff", neonSpeed = 30, neonThick = 1.5, rainbow = false,
+    radius = 1, borderScale = 1, font = "Gotham", textScale = 1,   -- interface style
+    -- layout (a theme is a full interface configuration)
+    winW = 880, winH = 450,
+    sbPos = "left", sbW = 196, sbLabels = true, sbSplit = false, sbGap = 10, sbFooter = true, sbCollapse = true,
+    titleBar = true, titleH = 38, ctrlLoc = "title",
+    edTree = true, edCrumb = true, edStatus = true, tabStyle = "flat",
+    home = { account = true, plan = true, license = true, version = true, exec = true, news = true },
+    navOff = {},
+    brandName = "", brandLogo = "",   -- "" = keep the current name / logo
+    watermark = false, panelDepth = 0, uiGrid = false, colorfulIcons = false,
+    showTitleVersion = false, logoIcon = true, logoText = true,
+    navLabelMode = "both", treeSide = "left", toolbarPos = "top",
 }
+local function cpv(v)
+    if type(v) == "table" then
+        local t = {}
+        for a, b in pairs(v) do t[a] = cpv(b) end
+        return t
+    end
+    return v
+end
 S.theme = type(S.theme) == "table" and S.theme or {}
-for k, v in pairs(TD) do if S.theme[k] == nil then S.theme[k] = v end end
+for k, v in pairs(TD) do if S.theme[k] == nil then S.theme[k] = cpv(v) end end
 local TH = S.theme
 local neonTrans, neonSeq
 do
@@ -386,7 +680,7 @@ do
         local t, exp = nowT(), issued * 60 + hrs * 3600
         if issued * 60 > t + 300 then return false, "clock" end
         if t >= exp then return false, "expired" end
-        return true, exp, fmt(s2)
+        return true, exp, fmt(s2), math.floor(nonce / 8388608)
     end
 end
 
@@ -426,6 +720,7 @@ server={{"r",36,46,220,112,20,20},{"r",36,144,220,210,20,20},{"c",76,79,8,2,1},{
 check={{"l",48,136,104,190,20},{"l",104,190,210,74,20}},
 list={{"c",52,70,9,2,1},{"l",90,70,212,70,16},{"c",52,128,9,2,1},{"l",90,128,212,128,16},{"c",52,186,9,2,1},{"l",90,186,212,186,16}},
 bolt={{"l",152,30,70,142,16},{"l",70,142,126,142,16},{"l",126,142,104,226,16},{"l",104,226,190,106,16},{"l",190,106,134,106,16},{"l",134,106,152,30,16}},
+boltfill={{"f",154.7,18,155.8,22},{"f",152.1,22,155.5,26},{"f",149.4,26,155.2,30},{"f",146.8,30,154.9,34},{"f",144.2,34,154.6,38},{"f",141.6,38,154.3,42},{"f",138.9,42,154,46},{"f",136.3,46,153.7,50},{"f",133.7,50,153.4,54},{"f",131.1,54,153.1,58},{"f",128.4,58,152.8,62},{"f",125.8,62,152.5,66},{"f",123.2,66,152.2,70},{"f",120.6,70,151.8,74},{"f",117.9,74,151.5,78},{"f",115.3,78,151.2,82},{"f",112.7,82,150.9,86},{"f",110.1,86,150.6,90},{"f",107.4,90,150.3,94},{"f",104.8,94,208,98},{"f",102.2,98,205,102},{"f",99.6,102,201.9,106},{"f",96.9,106,198.9,110},{"f",94.3,110,195.8,114},{"f",91.7,114,192.8,118},{"f",89.1,118,189.7,122},{"f",86.4,122,186.7,126},{"f",83.8,126,183.7,130},{"f",81.2,130,180.6,134},{"f",78.6,134,177.6,138},{"f",75.9,138,174.5,142},{"f",73.3,142,171.5,146},{"f",123.5,146,168.5,150},{"f",122.4,150,165.4,154},{"f",121.4,154,162.4,158},{"f",120.3,158,159.3,162},{"f",119.3,162,156.3,166},{"f",118.3,166,153.2,170},{"f",117.2,170,150.2,174},{"f",116.2,174,147.2,178},{"f",115.1,178,144.1,182},{"f",114.1,182,141.1,186},{"f",113,186,138,190},{"f",112,190,135,194},{"f",111,194,131.9,198},{"f",109.9,198,128.9,202},{"f",108.9,202,125.9,206},{"f",107.8,206,122.8,210},{"f",106.8,210,119.8,214},{"f",105.7,214,116.7,218},{"f",104.7,218,113.7,222},{"f",103.7,222,110.6,226},{"f",102.6,226,107.6,230},{"f",101.6,230,104.6,234},{"f",100.5,234,101.5,238}},
 move={{"l",128,40,128,216,20},{"l",40,128,216,128,20},{"l",102,66,128,40,16},{"l",128,40,154,66,16},{"l",102,190,128,216,16},{"l",128,216,154,190,16},{"l",66,102,40,128,16},{"l",40,128,66,154,16},{"l",190,102,216,128,16},{"l",216,128,190,154,16}},
 book={{"r",40,48,216,208,18,20},{"l",128,48,128,208,16},{"l",70,100,104,100,14},{"l",152,100,186,100,14}}
 }
@@ -567,18 +862,130 @@ local gui = new("ScreenGui", {
 })
 local blur = new("BlurEffect", { Size = 0, Parent = game:GetService("Lighting") })
 
+----------------------------------------------------------------------
+-- BRANDING: custom name + logo (letter / emoji / image)
+----------------------------------------------------------------------
+local BR = { logos = {}, defaultName = "SM1LER" }
+do
+    DB.brand = type(DB.brand) == "table" and DB.brand or {}
+    local function trim(t) return (string.gsub(tostring(t or ""), "^%s*(.-)%s*$", "%1")) end
+    local function replaceWord(text, old, new)
+        local out, i = {}, 1
+        while true do
+            local a, b = string.find(text, old, i, true)
+            if not a then out[#out + 1] = string.sub(text, i) break end
+            local before, after = string.sub(text, a - 1, a - 1), string.sub(text, b + 1, b + 1)
+            local isWord = not string.find(before, "[%w_]") and not string.find(after, "[%w_]")
+            out[#out + 1] = string.sub(text, i, a - 1) .. (isWord and new or old)
+            i = b + 1
+        end
+        return table.concat(out)
+    end
+    function BR.resolve(spec)
+        if type(spec) ~= "string" or spec == "" then return nil end
+        if string.find(spec, "^rbxassetid://") or string.find(spec, "^rbxasset://") then return spec end
+        if string.find(spec, "^%d%d%d+$") then return "rbxassetid://" .. spec end
+        if getcustomasset and isfile then
+            local ok, has = pcall(isfile, spec)
+            if ok and has then
+                local ok2, url = pcall(getcustomasset, spec)
+                if ok2 and url then return url end
+            end
+        end
+        return nil
+    end
+    if type(DB.brand.name) == "string" and DB.brand.name ~= "" then CFG.Name = DB.brand.name end
+    BR.image = BR.resolve(DB.brand.imgSpec)
+    local function paintOne(e)
+        if DB.brand.vectorLogo then
+            e.l.Text, e.img.Visible = "", false
+            e.vec.Visible = true
+            local sz = math.floor(math.min(e.l.AbsoluteSize.X, e.l.AbsoluteSize.Y) * 0.6 + 0.5)
+            if sz < 4 then sz = 18 end
+            for _, c in ipairs(e.vec:GetChildren()) do c:Destroy() end
+            centered(icon(e.vec, "boltfill", sz, Color3.new(0, 0, 0))).Parent = e.vec
+        elseif BR.image then
+            e.l.Text, e.vec.Visible = "", false
+            e.img.Image, e.img.Visible = BR.image, true
+        else
+            e.l.Text, e.img.Visible, e.vec.Visible = DB.brand.logo or "S", false, false
+        end
+    end
+    function BR.paint()
+        local keep = {}
+        for _, e in ipairs(BR.logos) do
+            if e.l and e.l.Parent then keep[#keep + 1] = e paintOne(e) end
+        end
+        BR.logos = keep
+    end
+    -- registers a rounded TextLabel/TextButton as a logo (text mode) and adds an image layer for image mode
+    function BR.addLogo(label)
+        local img = new("ImageLabel", { Parent = label, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ScaleType = Enum.ScaleType.Crop,
+            Visible = false, ZIndex = label.ZIndex + 1, BorderSizePixel = 0 })
+        local vec = new("Frame", { Parent = label, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, ZIndex = label.ZIndex + 1, BorderSizePixel = 0 })
+        local cr = label:FindFirstChildOfClass("UICorner")
+        if cr then new("UICorner", { Parent = img, CornerRadius = cr.CornerRadius }) end
+        local e = { l = label, img = img, vec = vec }
+        BR.logos[#BR.logos + 1] = e
+        if #BR.logos > 60 then
+            local keep = {}
+            for _, x in ipairs(BR.logos) do if x.l.Parent then keep[#keep + 1] = x end end
+            BR.logos = keep
+        end
+        paintOne(e)
+        return label
+    end
+    function BR.setName(name)
+        name = trim(name)
+        if name == "" then name = BR.defaultName end
+        if (utf8.len(name) or #name) > 14 then name = string.sub(name, 1, (utf8.offset(name, 15) or 15) - 1) end
+        if (utf8.len(name) or #name) < 3 then return CFG.Name, false end
+        local old = CFG.Name
+        if old == name then return name, true end
+        CFG.Name = name
+        DB.brand.name = (name ~= BR.defaultName) and name or nil
+        saveDB()
+        for _, d in ipairs(gui:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Font ~= Enum.Font.Code and d.Text ~= "" and string.find(d.Text, old, 1, true) then
+                d.Text = replaceWord(d.Text, old, name)
+            end
+        end
+        return name, true
+    end
+    -- spec: "" (reset) | "bolt" (generated vector mark) | 1-2 characters | asset id / rbxassetid://... | file in the workspace folder
+    function BR.setLogo(spec)
+        spec = trim(spec)
+        if spec == "" then
+            DB.brand.logo, DB.brand.imgSpec, DB.brand.vectorLogo, BR.image = nil, nil, nil, nil
+        elseif spec == "bolt" then
+            DB.brand.vectorLogo, DB.brand.logo, DB.brand.imgSpec, BR.image = true, nil, nil, nil
+        elseif (utf8.len(spec) or #spec) <= 2 and not string.find(spec, "^%d%d%d+$") then
+            DB.brand.vectorLogo = nil
+            DB.brand.logo, DB.brand.imgSpec, BR.image = spec, nil, nil
+        else
+            DB.brand.vectorLogo = nil
+            local url = BR.resolve(spec)
+            if not url then return false, G("Image not found. Use an asset id or a file in the workspace folder.", "Картинка не найдена. Используй id ассета или файл из папки workspace.") end
+            DB.brand.imgSpec, DB.brand.logo, BR.image = spec, nil, url
+        end
+        saveDB()
+        BR.paint()
+        return true
+    end
+end
+
 local function makeBrand(z)
     local B = {}
     local root = new("Frame", { Parent = gui, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, ZIndex = z, Active = true })
     local grp = new("CanvasGroup", { Parent = root, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0 })
-    makeSnow(grp, 70, 5).always = true
+    makeSnow(grp, 70, 5)
     local center = new("Frame", { Parent = grp, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.46), Size = UDim2.fromOffset(320, 210), BackgroundTransparency = 1 })
     local ring = new("Frame", { Parent = center, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 0), Size = UDim2.fromOffset(88, 88), BackgroundTransparency = 1 },
         { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }), neonStroke(2.5, 140), new("UIScale") })
     local logoScale = ring:FindFirstChildOfClass("UIScale")
-    new("TextLabel", { Parent = ring, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(62, 62),
+    BR.addLogo(new("TextLabel", { Parent = ring, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(62, 62),
         BackgroundColor3 = Color3.new(1, 1, 1), Text = "S", Font = Enum.Font.GothamBlack, TextSize = 36, TextColor3 = Color3.new(0, 0, 0) },
-        { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) })
+        { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) }))
     local row = new("Frame", { Parent = center, Position = UDim2.fromOffset(0, 104), Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1 },
         { new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center,
             SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 3) }) })
@@ -640,10 +1047,10 @@ local function notify(text)
         Parent = gui, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, -50),
         AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 32), BackgroundColor3 = C.bg, ZIndex = 100,
     }, { round(16), stroke(C.line), hlist(8), new("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 14) }) })
-    local dot = new("TextLabel", {
+    local dot = BR.addLogo(new("TextLabel", {
         Parent = t, LayoutOrder = 1, Size = UDim2.fromOffset(22, 22), BackgroundColor3 = C.item, Text = "S",
         Font = Enum.Font.GothamBlack, TextSize = 12, TextColor3 = C.white, ZIndex = 101,
-    }, { round(11) })
+    }, { round(11) }))
     new("TextLabel", {
         Parent = t, LayoutOrder = 2, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 32),
         BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = C.text, Text = text, ZIndex = 101,
@@ -709,6 +1116,7 @@ end
 -- Logging
 ----------------------------------------------------------------------
 local logs, consoleAppend = {}, nil
+local logHooks = {}
 local recentOut = {}
 DB.banned = type(DB.banned) == "table" and DB.banned or {}
 -- signature of an error: lowercase, trimmed, digits collapsed (so the same error with changing numbers is one error)
@@ -724,6 +1132,7 @@ local function addLog(kind, text)
     logs[#logs + 1] = e
     if #logs > 500 then table.remove(logs, 1) end
     if consoleAppend then consoleAppend(e) end
+    for _, f in ipairs(logHooks) do pcall(f, e) end
 end
 bind(game:GetService("LogService").MessageOut, function(msg, mt)
     local seen = recentOut[msg]
@@ -738,7 +1147,7 @@ end)
 ----------------------------------------------------------------------
 -- Window / pages
 ----------------------------------------------------------------------
-local WIN_W, WIN_H = 700, 372
+local WIN_W, WIN_H = TH.winW, TH.winH
 local win = new("Frame", {
     Parent = gui, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
     Size = UDim2.fromOffset(WIN_W, WIN_H), BackgroundTransparency = 1, Visible = false,
@@ -749,24 +1158,68 @@ local function targetScale()
     return math.min(1, (vp.X - 16) / (WIN_W + 8), (vp.Y - 16) / (WIN_H + 8)) * (S.uiSize / 100)
 end
 
-local sidebar = new("Frame", { Parent = win, Size = UDim2.new(0, 58, 1, 0), BackgroundColor3 = C.bg }, { round(18), neonStroke(TH.neonThick, TH.neonSpeed, true) })
-local sbBg = new("Frame", { Parent = sidebar, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0 },
-    { round(18), new("UIGradient", { Enabled = false }) })
-local indicator = new("Frame", {
-    Parent = sidebar, Size = UDim2.fromOffset(3, 22), Position = UDim2.fromOffset(0, 21), BackgroundColor3 = C.white,
-}, { round(2) })
+-- LAYOUT: every region of the window is described by the theme (TH.*), LY.apply() lays everything out
+local SB = { collapsed = S.sbCollapsed == true }
+local LY = { hooks = {} }
+function LY.rects()
+    local c = TH
+    local W, H = c.winW, c.winH
+    local tb = c.titleBar and c.titleH or 0
+    local split = c.sbSplit
+    local gap = split and (c.sbGap or 10) or 0
+    local sbw = SB.collapsed and 56 or c.sbW
+    local sbh = 46
+    local top, right = c.sbPos == "top", c.sbPos == "right"
+    local R = { tb = tb, sbw = sbw, sbh = sbh }
+    if top then
+        if split then R.sb, R.ct = { 0, 0, W, sbh }, { 0, sbh + gap, W, H - sbh - gap }
+        else R.sb, R.ct = { 0, tb, W, sbh }, { 0, 0, W, H } end
+    elseif right then
+        if split then R.sb, R.ct = { W - sbw, 0, sbw, H }, { 0, 0, W - sbw - gap, H }
+        else R.sb, R.ct = { W - sbw, tb, sbw, H - tb }, { 0, 0, W, H } end
+    else
+        if split then R.sb, R.ct = { 0, 0, sbw, H }, { sbw + gap, 0, W - sbw - gap, H }
+        else R.sb, R.ct = { 0, tb, sbw, H - tb }, { 0, 0, W, H } end
+    end
+    local cw, ch = R.ct[3], R.ct[4]
+    local px, py, pw, ph = 0, 0, cw, ch
+    if tb > 0 then py, ph = tb + 1, ch - tb - 1 end
+    if not split then
+        if top then py, ph = py + sbh + 1, ph - sbh - 1
+        elseif right then pw = cw - sbw - 1
+        else px, pw = sbw + 1, cw - sbw - 1 end
+    end
+    R.pg = { px, py, pw, ph }
+    return R
+end
+local R0 = LY.rects()
+
+-- window frame (background layers + neon border)
 local content = new("Frame", {
-    Parent = win, Position = UDim2.new(0, 68, 0, 0), Size = UDim2.new(1, -68, 1, 0), BackgroundColor3 = C.bg,
-}, { round(18), neonStroke(TH.neonThick, TH.neonSpeed, true) })
+    Parent = win, Position = UDim2.fromOffset(R0.ct[1], R0.ct[2]), Size = UDim2.fromOffset(R0.ct[3], R0.ct[4]), BackgroundColor3 = C.bg,
+}, { round(14), neonStroke(TH.neonThick, TH.neonSpeed, true) })
 local bgC = new("Frame", { Parent = content, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0 },
-    { round(18), new("UIGradient", { Enabled = false }) })
+    { round(14), new("UIGradient", { Enabled = false }) })
 local bgI = new("ImageLabel", { Parent = content, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = "", Visible = false, ScaleType = Enum.ScaleType.Crop, BorderSizePixel = 0 },
-    { round(18) })
+    { round(14) })
 local bgD = new("Frame", { Parent = content, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1, BorderSizePixel = 0 },
-    { round(18) })
+    { round(14) })
 local mainSnow = makeSnow(content, 24, 4, win)
 mainSnow.holder.Visible = S.snow ~= false
+local lineT = new("Frame", { Parent = content, Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = C.line, BorderSizePixel = 0 })
 
+-- sidebar: transparent over the window (flat) or its own rounded card (split)
+local sidebar = new("Frame", { Parent = win, Position = UDim2.fromOffset(R0.sb[1], R0.sb[2]), Size = UDim2.fromOffset(R0.sb[3], R0.sb[4]), BackgroundColor3 = C.bg,
+    BackgroundTransparency = TH.sbSplit and 0 or 1, BorderSizePixel = 0 },
+    { round(14), neonStroke(TH.neonThick, TH.neonSpeed, true) })
+local sbStroke = sidebar:FindFirstChildOfClass("UIStroke")
+sbStroke.Enabled = false
+local sbBg = new("Frame", { Parent = sidebar, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false },
+    { round(14), new("UIGradient", { Enabled = false }) })
+local lineV = new("Frame", { Parent = win, Size = UDim2.fromOffset(1, 100), BackgroundColor3 = C.line, BorderSizePixel = 0 })
+local lineH = new("Frame", { Parent = win, Size = UDim2.fromOffset(100, 1), BackgroundColor3 = C.line, BorderSizePixel = 0 })
+
+local NAV_COLORS = { Color3.fromRGB(240, 120, 120), Color3.fromRGB(240, 190, 100), Color3.fromRGB(130, 220, 140), Color3.fromRGB(110, 180, 240), Color3.fromRGB(190, 140, 240) }
 local pages, navBtns, navOrder = {}, {}, {}
 local currentPage
 local function showPage(name)
@@ -774,29 +1227,34 @@ local function showPage(name)
     S.lastPage = name
     for n, p in pairs(pages) do p.Visible = (n == name) end
     for n, o in pairs(navBtns) do
-        tint(o.ic, n == name and C.white or C.sub)
+        local on = n == name
+        tint(o.ic, on and C.white or (TH.colorfulIcons and o.navColor or C.sub))
+        o.lb.TextColor3 = on and C.text or C.sub
+        tween(o.b, 0.12, { BackgroundTransparency = on and 0 or 1 })
     end
-    local i = navOrder[name]
-    if i then tween(indicator, 0.18, { Position = UDim2.fromOffset(0, 12 + (i - 1) * 43 + 8) }) end
 end
 
 local function addPage(name, iconName)
-    local i = #navOrder + 1
-    for _ in pairs(navOrder) do end
-    navOrder[name] = (function() local c = 0 for _ in pairs(navOrder) do c = c + 1 end return c + 1 end)()
-    local idx = navOrder[name]
+    local idx = 0
+    for _ in pairs(navOrder) do idx = idx + 1 end
+    idx = idx + 1
+    navOrder[name] = idx
     local b = new("TextButton", {
-        Parent = sidebar, Size = UDim2.fromOffset(40, 38), Position = UDim2.fromOffset(9, 12 + (idx - 1) * 43),
-        BackgroundTransparency = 1, AutoButtonColor = false, Text = "",
-    })
-    local ic = centered(icon(b, iconName, 22, C.sub))
-    ic.Parent = b
-    navBtns[name] = { b = b, ic = ic }
+        Parent = sidebar, Position = UDim2.fromOffset(8, 10 + (idx - 1) * 36), Size = UDim2.new(1, -16, 0, 32),
+        BackgroundColor3 = C.item, BackgroundTransparency = 1, AutoButtonColor = false, Text = "",
+    }, { round(8) })
+    local ic = icon(b, iconName, 16, C.sub)
+    ic.Position = UDim2.fromOffset(10, 8)
+    local lb = txt(b, "", 13, C.sub, Enum.Font.GothamMedium)
+    lb.Position, lb.Size = UDim2.fromOffset(36, 0), UDim2.new(1, -44, 1, 0)
+    reg(lb, name)
+    navBtns[name] = { b = b, ic = ic, lb = lb, navColor = NAV_COLORS[(navOrder[name] - 1) % #NAV_COLORS + 1] }
     bind(b.MouseButton1Click, function() showPage(name) end)
-    bind(b.MouseEnter, function() if currentPage ~= name then tint(ic, C.text) end end)
-    bind(b.MouseLeave, function() if currentPage ~= name then tint(ic, C.sub) end end)
+    bind(b.MouseEnter, function() if currentPage ~= name then tween(b, 0.1, { BackgroundTransparency = 0.6 }) end end)
+    bind(b.MouseLeave, function() if currentPage ~= name then tween(b, 0.1, { BackgroundTransparency = 1 }) end end)
+    local R = LY.rects()
     local page = new("Frame", {
-        Parent = content, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false,
+        Parent = content, Position = UDim2.fromOffset(R.pg[1], R.pg[2]), Size = UDim2.fromOffset(R.pg[3], R.pg[4]), BackgroundTransparency = 1, Visible = false,
     }, { pad(16) })
     pages[name] = page
     return page
@@ -819,41 +1277,53 @@ local function applyPosition()
     win.Position = UDim2.fromScale(0.5, ({ Center = 0.5, Top = 0.3, Bottom = 0.7 })[S.pos] or 0.5)
 end
 
-local HEADER_BUILDERS, HEADER_RIGHT = {}, {}
-local CTRL_W = { sm1ler = 32, mac = 104, linux = 100 }
--- places an element at the right edge of a header, just left of the window buttons
+local HEADER_BUILDERS, TITLE_RIGHT, HEADER_RIGHT, HEADER_CTRL = {}, {}, {}, {}
+local CTRL_W = { win = 126, sm1ler = 32, mac = 104, linux = 100 }
+local function ctrlW() return CTRL_W[S.guiStyle or "win"] or 32 end
+local HEADER_OFF, TITLE_OFF = 0, 0
+-- places an element at the right edge of a page header (left of the window buttons when they live in the header)
 local function placeRight(o, y, gap)
     HEADER_RIGHT[#HEADER_RIGHT + 1] = { o = o, y = y or 0, gap = gap or 8 }
-    o.Position = UDim2.new(1, -((CTRL_W[S.guiStyle or "sm1ler"] or 32) + (gap or 8)), 0, y or 0)
+    o.Position = UDim2.new(1, -(HEADER_OFF + (gap or 8)), 0, y or 0)
+end
+-- places an element in the title bar, just left of the window buttons
+local function placeTitle(o, gap)
+    TITLE_RIGHT[#TITLE_RIGHT + 1] = { o = o, gap = gap or 12 }
+    o.Position = UDim2.new(1, -(TITLE_OFF + 6 + (gap or 12)), 0.5, 0)
 end
 local function applyGuiStyle()
     for _, f in ipairs(HEADER_BUILDERS) do pcall(f) end
-    for _, r in ipairs(HEADER_RIGHT) do
-        pcall(function() r.o.Position = UDim2.new(1, -((CTRL_W[S.guiStyle or "sm1ler"] or 32) + r.gap), 0, r.y) end)
-    end
+    if LY.apply then LY.apply(false) end
 end
 
-local function header(page, titleKey, withLogo)
-    local h = new("Frame", { Parent = page, Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1 })
-    local title
-    if withLogo then
-        local logo = new("TextLabel", {
-            Parent = h, Size = UDim2.fromOffset(34, 34), BackgroundColor3 = C.white, Text = "S", Font = Enum.Font.GothamBlack,
-            TextSize = 20, TextColor3 = C.black,
-        }, { round(17) })
-        title = txt(h, CFG.Name, 20, C.text, Enum.Font.GothamBold)
-        title.Position = UDim2.fromOffset(44, 0)
-        title.Size = UDim2.new(0, 220, 0, 20)
-    else
-        title = txt(h, "", 20, C.text, Enum.Font.GothamBold)
-        title.Size = UDim2.new(0, 160, 1, 0)
-        reg(title, titleKey)
-    end
-    local box = new("Frame", { Parent = h, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 2), Size = UDim2.fromOffset(104, 32), BackgroundTransparency = 1 })
+local function winControls(parent)
+    local box = new("Frame", { Parent = parent, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -6, 0.5, 0), Size = UDim2.fromOffset(126, 32), BackgroundTransparency = 1 })
     local function build()
         for _, ch in ipairs(box:GetChildren()) do ch:Destroy() end
         local style = S.guiStyle or "sm1ler"
-        if style == "mac" then
+        if style == "win" then
+            box.Size = UDim2.fromOffset(126, 32)
+            new("UIListLayout", { Parent = box, Padding = UDim.new(0, 0), FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder,
+                VerticalAlignment = Enum.VerticalAlignment.Center, HorizontalAlignment = Enum.HorizontalAlignment.Right })
+            local function wb(order, hoverColor, cb, draw)
+                local b = new("TextButton", { Parent = box, LayoutOrder = order, Size = UDim2.fromOffset(42, 32), BackgroundColor3 = hoverColor, BackgroundTransparency = 1,
+                    AutoButtonColor = false, Text = "" }, { round(6) })
+                draw(b)
+                bind(b.MouseEnter, function() tween(b, 0.1, { BackgroundTransparency = 0 }) end)
+                bind(b.MouseLeave, function() tween(b, 0.1, { BackgroundTransparency = 1 }) end)
+                bind(b.MouseButton1Click, cb)
+            end
+            wb(1, C.item, function() setOpen(false) end, function(b)
+                new("Frame", { Parent = b, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(11, 1), BackgroundColor3 = C.text, BorderSizePixel = 0 })
+            end)
+            wb(2, C.item, function() end, function(b)
+                new("Frame", { Parent = b, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(10, 10), BackgroundTransparency = 1 },
+                    { new("UIStroke", { Color = C.text, Thickness = 1 }) })
+            end)
+            wb(3, C.err, function() setOpen(false) end, function(b)
+                centered(icon(b, "x", 13, C.text)).Parent = b
+            end)
+        elseif style == "mac" then
             box.Size = UDim2.fromOffset(104, 32)
             new("UIListLayout", { Parent = box, Padding = UDim.new(0, 10), FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center, HorizontalAlignment = Enum.HorizontalAlignment.Right })
             local function dot(color, glyphColor, order, cb)
@@ -893,7 +1363,220 @@ local function header(page, titleKey, withLogo)
     end
     build()
     HEADER_BUILDERS[#HEADER_BUILDERS + 1] = build
+    return box
+end
+
+local function header(page, titleKey)
+    local h = new("Frame", { Parent = page, Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1 })
+    local title = txt(h, "", 20, C.text, Enum.Font.GothamBold)
+    title.Size = UDim2.new(0, 160, 1, 0)
+    reg(title, titleKey)
+    local hc = winControls(h)
+    hc.Visible = false   -- LY.apply decides where the window buttons live
+    HEADER_CTRL[#HEADER_CTRL + 1] = hc
     return h, title
+end
+
+-- title bar: logo, name, injector status, window buttons
+local TBAR = {}
+do
+    local titleBar = new("Frame", { Parent = content, Size = UDim2.new(1, 0, 0, TH.titleH), BackgroundTransparency = 1, Visible = TH.titleBar })
+    TBAR.frame = titleBar
+    local tLogo = BR.addLogo(new("TextLabel", { Parent = titleBar, Position = UDim2.fromOffset(14, 8), Size = UDim2.fromOffset(22, 22), BackgroundColor3 = C.white, Text = "S", Font = Enum.Font.GothamBlack,
+        TextSize = 13, TextColor3 = C.black }, { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) }))
+    for _, e in ipairs(BR.logos) do if e.l == tLogo then e.titleSlot = true end end
+    local tt = txt(titleBar, CFG.Name, 13, C.text, Enum.Font.GothamBold)
+    tt.Position, tt.Size = UDim2.fromOffset(44, 0), UDim2.new(0, 160, 1, 0)
+    TBAR.tt = tt
+    TBAR.verLbl = txt(titleBar, "v" .. CFG.Version, 11, C.sub, Enum.Font.Code)
+    TBAR.verLbl.Position, TBAR.verLbl.Size, TBAR.verLbl.Visible = UDim2.fromOffset(200, 0), UDim2.new(0, 60, 1, 0), TH.showTitleVersion
+    TBAR.controls = winControls(titleBar)
+    TBAR.pill = new("Frame", { Parent = titleBar, AnchorPoint = Vector2.new(1, 0.5), Size = UDim2.fromOffset(124, 24), BackgroundColor3 = C.panel }, { round(12), stroke() })
+    TBAR.dot = new("Frame", { Parent = TBAR.pill, Position = UDim2.fromOffset(10, 8), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = C.err, BorderSizePixel = 0 }, { round(4) })
+    TBAR.lbl = txt(TBAR.pill, G("Not injected", "Не подключён"), 12, C.text, Enum.Font.GothamMedium)
+    TBAR.lbl.Position, TBAR.lbl.Size = UDim2.fromOffset(26, 0), UDim2.new(1, -30, 1, 0)
+    placeTitle(TBAR.pill, 12)
+end
+
+-- sidebar footer: who is signed in
+local SBU = {}
+do
+    local card = new("Frame", { Parent = sidebar, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 8, 1, -10), Size = UDim2.new(1, -16, 0, 50), BackgroundColor3 = C.panel }, { round(10), stroke() })
+    local av = new("ImageLabel", { Parent = card, Position = UDim2.fromOffset(8, 8), Size = UDim2.fromOffset(34, 34), BackgroundColor3 = C.item, Image = "", BorderSizePixel = 0 },
+        { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) })
+    SBU.name = txt(card, dispName(), 12, C.text, Enum.Font.GothamBold)
+    SBU.name.Position, SBU.name.Size, SBU.name.TextTruncate = UDim2.fromOffset(50, 8), UDim2.new(1, -58, 0, 16), Enum.TextTruncate.AtEnd
+    SBU.sub = txt(card, G("Signed in", "Вошёл"), 11, C.sub)
+    SBU.sub.Position, SBU.sub.Size = UDim2.fromOffset(50, 26), UDim2.new(1, -58, 0, 14)
+    SBU.card, SBU.av = card, av
+    task.spawn(function()
+        local ok, url = pcall(function() return Players:GetUserThumbnailAsync(LP.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48) end)
+        if ok and url and av.Parent then av.Image = url end
+    end)
+end
+
+-- watermark (name + version, bottom-right of the window)
+local WMK = new("TextLabel", { Parent = win, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -10, 1, -6), Size = UDim2.fromOffset(200, 16),
+    BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 11, TextColor3 = Color3.new(1, 1, 1), TextTransparency = 0.5,
+    TextXAlignment = Enum.TextXAlignment.Right, Text = "", ZIndex = 50, Visible = false })
+task.spawn(function()
+    while alive do
+        WMK.Text = CFG.Name .. " · v" .. CFG.Version
+        task.wait(1)
+    end
+end)
+
+-- faint grid overlay inside the content area (decorative)
+local GRID = new("Frame", { Parent = content, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ClipsDescendants = true, Visible = false, ZIndex = 1, BorderSizePixel = 0 })
+local function buildGrid()
+    for _, c in ipairs(GRID:GetChildren()) do c:Destroy() end
+    local step = 24
+    for x = 0, WIN_W, step do
+        new("Frame", { Parent = GRID, Position = UDim2.fromOffset(x, 0), Size = UDim2.fromOffset(1, WIN_H), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.95, BorderSizePixel = 0 })
+    end
+    for y = 0, WIN_H, step do
+        new("Frame", { Parent = GRID, Position = UDim2.fromOffset(0, y), Size = UDim2.fromOffset(WIN_W, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.95, BorderSizePixel = 0 })
+    end
+end
+buildGrid()
+LY.hooks[#LY.hooks + 1] = buildGrid
+
+-- panel depth: adds a soft 1px shadow line under every C.panel-colored surface
+local PDEPTH = {}
+do
+    local tagged, lastDepth = {}, -1
+    function PDEPTH.apply(depth)
+        if depth == lastDepth then return end
+        lastDepth = depth
+        for _, d in ipairs(content:GetDescendants()) do
+            if d:IsA("Frame") and d.BackgroundColor3 == C.panel and d.BackgroundTransparency < 1 then
+                local sh = d:FindFirstChild("_depthShadow")
+                if depth <= 0 then
+                    if sh then sh:Destroy() end
+                else
+                    if not sh then
+                        sh = new("Frame", { Name = "_depthShadow", Parent = d, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0),
+                            Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, ZIndex = d.ZIndex })
+                    end
+                    sh.BackgroundTransparency = 1 - math.clamp(depth / 3, 0, 1) * 0.35
+                end
+            end
+        end
+    end
+end
+
+-- collapse / expand button (vertical sidebar)
+do
+    local cb = new("TextButton", { Parent = sidebar, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 8, 1, -68), Size = UDim2.new(1, -16, 0, 30),
+        BackgroundColor3 = C.item, BackgroundTransparency = 1, AutoButtonColor = false, Text = "" }, { round(8) })
+    local cic = icon(cb, "left", 14, C.sub)
+    cic.Position = UDim2.fromOffset(11, 8)
+    local clb = txt(cb, G("Collapse", "Свернуть"), 12, C.sub, Enum.Font.GothamMedium)
+    clb.Position, clb.Size = UDim2.fromOffset(36, 0), UDim2.new(1, -44, 1, 0)
+    SB.btn, SB.icon, SB.label = cb, cic, clb
+    bind(cb.MouseButton1Click, function()
+        SB.collapsed = not SB.collapsed
+        S.sbCollapsed = SB.collapsed
+        saveDB()
+        LY.apply(true)
+    end)
+    bind(cb.MouseEnter, function() tween(cb, 0.1, { BackgroundTransparency = 0.6 }) end)
+    bind(cb.MouseLeave, function() tween(cb, 0.1, { BackgroundTransparency = 1 }) end)
+end
+
+-- the layout engine: reads the theme and places every region
+function LY.apply(animate)
+    local c = TH
+    local R = LY.rects()
+    local d = animate and 0.15 or 0
+    local function put(o, props)
+        if d > 0 then tween(o, d, props) else for k, v in pairs(props) do o[k] = v end end
+    end
+    local resized = (WIN_W ~= c.winW or WIN_H ~= c.winH)
+    WIN_W, WIN_H = c.winW, c.winH
+    win.Size = UDim2.fromOffset(WIN_W, WIN_H)
+    if resized and win.Visible then uiScale.Scale = targetScale() end
+    local split, top, right = c.sbSplit, c.sbPos == "top", c.sbPos == "right"
+    local vertical = not top
+    put(content, { Position = UDim2.fromOffset(R.ct[1], R.ct[2]), Size = UDim2.fromOffset(R.ct[3], R.ct[4]) })
+    put(sidebar, { Position = UDim2.fromOffset(R.sb[1], R.sb[2]), Size = UDim2.fromOffset(R.sb[3], R.sb[4]) })
+    sbBg.Visible, sbStroke.Enabled = split, split
+    sidebar.BackgroundTransparency = split and 0 or 1
+    -- title bar and dividers
+    TBAR.frame.Visible = c.titleBar
+    TBAR.frame.Size = UDim2.new(1, 0, 0, c.titleH)
+    lineT.Visible = c.titleBar
+    lineT.Position = UDim2.fromOffset(0, c.titleH)
+    lineV.Visible = (not split) and vertical
+    lineV.Position = UDim2.fromOffset(right and (WIN_W - R.sbw - 1) or R.sbw, R.tb)
+    lineV.Size = UDim2.fromOffset(1, WIN_H - R.tb)
+    lineH.Visible = (not split) and top
+    lineH.Position = UDim2.fromOffset(0, R.tb + R.sbh)
+    lineH.Size = UDim2.fromOffset(WIN_W, 1)
+    -- navigation
+    local labMode = c.navLabelMode or (c.sbLabels == false and "icon" or "both")
+    local labels = labMode ~= "icon" and not SB.collapsed
+    local iconsOn = labMode ~= "text"
+    local NAVCOLORS = { Color3.fromRGB(240, 120, 120), Color3.fromRGB(240, 190, 100), Color3.fromRGB(130, 220, 140), Color3.fromRGB(110, 180, 240), Color3.fromRGB(190, 140, 240) }
+    local names = {}
+    for name, idx in pairs(navOrder) do names[#names + 1] = { name, idx } end
+    table.sort(names, function(a, b) return a[2] < b[2] end)
+    local pos = 0
+    for _, e in ipairs(names) do
+        local name = e[1]
+        local o = navBtns[name]
+        local hidden = type(c.navOff) == "table" and c.navOff[name] == true and name ~= "Settings" and name ~= "Theme"
+        o.b.Visible = not hidden
+        if not hidden then
+            if vertical then
+                o.b.Position, o.b.Size = UDim2.fromOffset(8, 10 + pos * 36), UDim2.new(1, -16, 0, 32)
+                o.lb.Position, o.lb.Size = UDim2.fromOffset(36, 0), UDim2.new(1, -44, 1, 0)
+            else
+                local w = labels and 112 or 40
+                o.b.Position, o.b.Size = UDim2.fromOffset(8 + pos * (w + 4), 7), UDim2.fromOffset(w, 32)
+                o.lb.Position, o.lb.Size = UDim2.fromOffset(32, 0), UDim2.new(1, -38, 1, 0)
+            end
+            o.ic.Position = labels and UDim2.fromOffset(10, 8) or UDim2.new(0.5, -8, 0, 8)
+            o.ic.Visible = iconsOn
+            o.lb.Visible = labels
+            pos = pos + 1
+        end
+    end
+    -- footer + collapse button
+    SBU.card.Visible = c.sbFooter and vertical
+    SB.btn.Visible = c.sbCollapse and vertical
+    SB.btn.Position = UDim2.new(0, 8, 1, c.sbFooter and -68 or -10)
+    SB.icon.Rotation = SB.collapsed and 180 or 0
+    SB.label.Visible = not SB.collapsed
+    SBU.name.Visible, SBU.sub.Visible = not SB.collapsed, not SB.collapsed
+    SBU.av.Position = UDim2.fromOffset(SB.collapsed and 3 or 8, 8)
+    -- pages
+    for _, pg in pairs(pages) do put(pg, { Position = UDim2.fromOffset(R.pg[1], R.pg[2]), Size = UDim2.fromOffset(R.pg[3], R.pg[4]) }) end
+    -- logo / name / version visibility
+    for _, e in ipairs(BR.logos) do
+        if e.titleSlot then e.l.Visible = c.logoIcon end
+    end
+    if TBAR.tt then TBAR.tt.Visible = c.logoText end
+    if TBAR.verLbl then TBAR.verLbl.Visible = c.showTitleVersion end
+    if WMK then WMK.Visible = c.watermark end
+    -- colourful nav icons
+    for _, nm in ipairs(names) do
+        local o = navBtns[nm[1]]
+        if o and iconsOn then tint(o.ic, (currentPage == nm[1]) and C.white or (c.colorfulIcons and o.navColor or C.sub)) end
+    end
+    -- faint UI grid overlay
+    if GRID then GRID.Visible = c.uiGrid end
+    -- panel depth (adds/removes a soft bottom shadow line on every panel-colored surface)
+    if PDEPTH then PDEPTH.apply(c.panelDepth or 0) end
+    -- window buttons: title bar or page headers
+    local useTitle = c.titleBar and c.ctrlLoc == "title"
+    TBAR.controls.Visible = useTitle
+    for _, hc in ipairs(HEADER_CTRL) do hc.Visible = not useTitle end
+    HEADER_OFF = useTitle and 0 or ctrlW()
+    TITLE_OFF = useTitle and ctrlW() or 0
+    for _, r in ipairs(HEADER_RIGHT) do r.o.Position = UDim2.new(1, -(HEADER_OFF + r.gap), 0, r.y) end
+    for _, r in ipairs(TITLE_RIGHT) do r.o.Position = UDim2.new(1, -(TITLE_OFF + 6 + r.gap), 0.5, 0) end
+    for _, f in ipairs(LY.hooks) do pcall(f) end
 end
 
 -- modal ----------------------------------------------------------------
@@ -925,73 +1608,134 @@ local runSource, openInEditor
 local refreshHome
 do
     local homePage = addPage("Home", "home")
-    local h = header(homePage, nil, true)
-    local sub = txt(h, "", 12, C.sub)
-    sub.Position = UDim2.fromOffset(44, 20)
-    sub.Size = UDim2.new(0, 260, 0, 16)
-    local exp = txt(h, "", 11, C.sub, Enum.Font.Gotham, Enum.TextXAlignment.Right)
-    exp.AnchorPoint = Vector2.new(1, 0)
-    placeRight(exp, 0, 12)
-    exp.Size = UDim2.fromOffset(120, 36)
+    local homeScroll = new("ScrollingFrame", { Parent = homePage, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y })
+    local h, homeTitle = header(homeScroll, "Overview")
+    local hLogo = BR.addLogo(new("TextLabel", { Parent = h, Size = UDim2.fromOffset(34, 34), BackgroundColor3 = C.white, Text = "S", Font = Enum.Font.GothamBlack,
+        TextSize = 20, TextColor3 = C.black }, { round(17) }))
+    local hName = txt(h, CFG.Name, 20, C.text, Enum.Font.GothamBold)
+    hName.Position, hName.Size = UDim2.fromOffset(44, 0), UDim2.new(0, 220, 0, 34)
+    local sub = txt(h, "", 12, C.sub, Enum.Font.Gotham, Enum.TextXAlignment.Right)
+    sub.AnchorPoint = Vector2.new(1, 0)
+    sub.Size = UDim2.fromOffset(300, 36)
+    placeRight(sub, 0, 4)
+    -- Overview cards (Volt style)
+    local PLAN = { [1] = "FlashKey", [2] = "LinkVault", [3] = "GoldPass" }
+    STAT.listeners[#STAT.listeners + 1] = function() if refreshHome then pcall(refreshHome) end end
+    local function card(x, y, w, hgt)
+        return new("Frame", { Parent = homeScroll, Position = UDim2.new(x, x > 0 and 4 or 0, 0, y), Size = UDim2.new(w, w < 1 and -4 or 0, 0, hgt), BackgroundColor3 = C.panel }, { round(12), stroke() })
+    end
+    local function tx(parent, size, color, font, y, right, part)
+        local o = txt(parent, "", size, color, font, right and Enum.TextXAlignment.Right or Enum.TextXAlignment.Left)
+        if part == "r" then o.Position, o.Size = UDim2.new(0.5, 0, 0, y), UDim2.new(0.5, -14, 0, size + 8)
+        elseif part == "l" then o.Position, o.Size = UDim2.fromOffset(14, y), UDim2.new(0.5, -14, 0, size + 8)
+        else o.Position, o.Size = UDim2.fromOffset(14, y), UDim2.new(1, -28, 0, size + 8) end
+        o.TextTruncate = Enum.TextTruncate.AtEnd
+        return o
+    end
+    local cA, cP = card(0, 52, 0.5, 56), card(0.5, 52, 0.5, 56)
+    tx(cA, 11, C.sub, Enum.Font.Gotham, 9).Text = G("Account", "Аккаунт")
+    local aV = tx(cA, 15, C.text, Enum.Font.GothamBold, 26)
+    tx(cP, 11, C.sub, Enum.Font.Gotham, 9, true).Text = G("Plan", "Тариф")
+    local pV = tx(cP, 15, C.text, Enum.Font.GothamBold, 26, true)
+    local cL = card(0, 116, 1, 72)
+    tx(cL, 11, C.sub, Enum.Font.Gotham, 9, false, "l").Text = G("License", "Лицензия")
+    local lV = tx(cL, 17, C.text, Enum.Font.GothamBold, 26, false, "l")
+    local lS = tx(cL, 11, C.sub, Enum.Font.Gotham, 50, false, "l")
+    tx(cL, 11, C.sub, Enum.Font.Gotham, 9, true, "r").Text = G("Time remaining", "Осталось времени")
+    local tV = tx(cL, 17, C.text, Enum.Font.GothamBold, 26, true, "r")
+    local cS = card(0, 196, 1, 56)
+    tx(cS, 11, C.sub, Enum.Font.Gotham, 8, false, "l").Text = G("Status", "Статус")
+    local stDot1 = new("Frame", { Parent = cS, Position = UDim2.fromOffset(14, 28), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = C.ok, BorderSizePixel = 0 }, { round(4) })
+    local stTxt1 = txt(cS, "", 12, C.text, Enum.Font.GothamMedium)
+    stTxt1.Position, stTxt1.Size = UDim2.fromOffset(28, 20), UDim2.fromOffset(180, 16)
+    tx(cS, 11, C.sub, Enum.Font.Gotham, 8, true, "r").Text = G("Detection", "Детект")
+    local stDot2 = new("Frame", { Parent = cS, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -170, 0, 28), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = C.ok, BorderSizePixel = 0 }, { round(4) })
+    local stTxt2 = txt(cS, "", 12, C.text, Enum.Font.GothamMedium, Enum.TextXAlignment.Right)
+    stTxt2.Position, stTxt2.Size = UDim2.new(1, -176, 0, 20), UDim2.fromOffset(160, 16)
+    local cV, cE = card(0, 260, 0.5, 64), card(0.5, 260, 0.5, 64)
+    tx(cV, 11, C.sub, Enum.Font.Gotham, 9).Text = G("SM1LER version", "Версия SM1LER")
+    tx(cV, 15, C.text, Enum.Font.GothamBold, 26).Text = "v" .. CFG.Version
+    tx(cV, 11, C.sub, Enum.Font.Gotham, 46).Text = CFG.Update.ManifestUrl ~= "" and G("Auto-update: on", "Автообновление: вкл") or G("Auto-update: off", "Автообновление: выкл")
+    tx(cE, 11, C.sub, Enum.Font.Gotham, 9, true).Text = G("Executor", "Экзекьютор")
+    local exeName, robloxV = "unknown", "?"
+    pcall(function()
+        if identifyexecutor then
+            local n, v = identifyexecutor()
+            exeName = tostring(n) .. (v and (" " .. tostring(v)) or "")
+        end
+    end)
+    pcall(function() robloxV = version() end)
+    tx(cE, 15, C.text, Enum.Font.GothamBold, 26, true).Text = exeName
+    tx(cE, 11, C.sub, Enum.Font.Gotham, 46, true).Text = "Roblox " .. robloxV
+
+    local cW = card(0, 332, 1, 58)
+    tx(cW, 11, C.sub, Enum.Font.Gotham, 8).Text = G("What's new", "Что нового")
+    tx(cW, 12, C.text, Enum.Font.GothamMedium, 24).Text = G("v1.5.0 · Volt-style window: sidebar, title bar, injector status", "v1.5.0 · окно в стиле Volt: боковая панель, строка заголовка, статус инжектора")
+    tx(cW, 11, C.sub, Enum.Font.Gotham, 42).Text = G("v1.4.0 · .theme files are found automatically · snow is off by default", "v1.4.0 · файлы .theme находятся автоматически · снег выключен по умолчанию")
+
+    -- cards flow into rows; the theme decides which cards exist
+    local CARDS = { { "account", cA, 1, 56 }, { "plan", cP, 1, 56 }, { "license", cL, 2, 72 }, { "status", cS, 2, 56 }, { "version", cV, 1, 64 }, { "exec", cE, 1, 64 }, { "news", cW, 2, 58 } }
+    local function layoutHome()
+        local y, pend = 52, nil
+        local cfg = type(TH.home) == "table" and TH.home or {}
+        local function place(card, x, w, off, hgt)
+            card.Position = UDim2.new(x, off, 0, y)
+            card.Size = UDim2.new(w, w < 1 and -4 or 0, 0, hgt)
+        end
+        for _, c in ipairs(CARDS) do c[2].Visible = false end
+        for _, c in ipairs(CARDS) do
+            if cfg[c[1]] ~= false then
+                if c[3] == 2 then
+                    if pend then place(pend[2], 0, 1, 0, pend[4]) pend[2].Visible = true y = y + pend[4] + 8 pend = nil end
+                    place(c[2], 0, 1, 0, c[4]) c[2].Visible = true y = y + c[4] + 8
+                elseif pend then
+                    local hgt = math.max(pend[4], c[4])
+                    place(pend[2], 0, 0.5, 0, hgt) place(c[2], 0.5, 0.5, 4, hgt)
+                    pend[2].Visible, c[2].Visible = true, true
+                    y = y + hgt + 8
+                    pend = nil
+                else
+                    pend = c
+                end
+            end
+        end
+        if pend then place(pend[2], 0, 1, 0, pend[4]) pend[2].Visible = true end
+        local tbOn = TH.titleBar
+        hLogo.Visible, hName.Visible, homeTitle.Visible = not tbOn, not tbOn, tbOn
+    end
+    LY.hooks[#LY.hooks + 1] = layoutHome
+    layoutHome()
+
     function refreshHome()
+        SBU.name.Text = dispName()
+        SBU.sub.Text = PLAN[DB.planTier] or G("Signed in", "Вошёл")
         sub.Text = T("Welcome back") .. ", " .. dispName()
-        exp.Text = T("Expires") .. "\n" .. keyLeftText()
+        aV.Text = "@" .. userName()
+        pV.Text = PLAN[DB.planTier] or G("Standard", "Стандарт")
+        lV.Text = KEY.value and G("Active key", "Активный ключ") or G("No key", "Нет ключа")
+        lS.Text = KEY.value and (G("Valid until ", "Действует до ") .. os.date("%b %d, %H:%M", KEY.expires)) or ""
+        tV.Text = keyLeftText()
+        local dotColor = { ok = C.ok, updating = C.warn, down = C.err }
+        stDot1.BackgroundColor3 = dotColor[STAT.status] or C.ok
+        stTxt1.Text = STAT.icon(STAT.status) .. " " .. STAT.label(STAT.status)
+        stDot2.BackgroundColor3 = dotColor[STAT.detect] or C.ok
+        stTxt2.Text = STAT.icon(STAT.detect) .. " " .. STAT.label(STAT.detect)
+        if #STAT.changelog > 0 then
+            for _, c in ipairs(cW:GetChildren()) do if c.Name == "_log" then c:Destroy() end end
+            local y = 24
+            for i = 1, math.min(3, #STAT.changelog) do
+                local l = txt(cW, "• " .. tostring(STAT.changelog[i]), 11, i == 1 and C.text or C.sub, i == 1 and Enum.Font.GothamMedium or Enum.Font.Gotham)
+                l.Name, l.Position, l.Size, l.TextTruncate = "_log", UDim2.fromOffset(14, y), UDim2.new(1, -28, 0, 16), Enum.TextTruncate.AtEnd
+                y = y + 16
+            end
+        end
     end
     refreshHome()
-
-    local nav = new("Frame", { Parent = homePage, Position = UDim2.fromOffset(0, 50), Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1 },
-        { new("UIGridLayout", { CellSize = UDim2.new(0.25, -6, 1, 0), CellPadding = UDim2.fromOffset(8, 0), SortOrder = Enum.SortOrder.LayoutOrder }) })
-    for i, p in ipairs({ { "Editor", "pencil" }, { "Scripts", "code" }, { "Console", "terminal" }, { "Settings", "gear" } }) do
-        local P = pill(nav, p[1], p[2], UDim2.new(), function() showPage(p[1]) end)
-        P.b.LayoutOrder = i
-    end
-
-    local ql = txt(homePage, "", 12, C.sub)
-    ql.Position = UDim2.fromOffset(0, 108)
-    ql.Size = UDim2.new(1, 0, 0, 16)
-    reg(ql, "Quick scripts")
-    local grid = new("Frame", { Parent = homePage, Position = UDim2.fromOffset(0, 130), Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1 },
-        { new("UIGridLayout", { CellSize = UDim2.new(1 / 3, -6, 1, 0), CellPadding = UDim2.fromOffset(8, 0), SortOrder = Enum.SortOrder.LayoutOrder }) })
-    for i, nm in ipairs({ "Hello world", "Executor Tester", "Infinite yield" }) do
-        local P = pill(grid, nm, "play", UDim2.new(), function()
-            for _, s in ipairs(DB.scripts) do if s.name == nm then runSource(s.name, s.src) return end end
-            notify("Script not found: " .. nm)
-        end)
-        P.b.LayoutOrder = i
-    end
-
-    local info = new("Frame", { Parent = homePage, Position = UDim2.fromOffset(0, 190), Size = UDim2.new(1, 0, 0, 78), BackgroundColor3 = C.panel }, { round(14), stroke() })
-    local function stat(xs, w, key)
-        local t = txt(info, "", 11, C.sub)
-        t.Position = UDim2.new(xs, 14, 0, 12)
-        t.Size = UDim2.new(w, -10, 0, 14)
-        reg(t, key)
-        local v = txt(info, "-", 13, C.text, Enum.Font.GothamMedium)
-        v.Position = UDim2.new(xs, 14, 0, 38)
-        v.Size = UDim2.new(w, -10, 0, 20)
-        v.TextTruncate = Enum.TextTruncate.AtEnd
-        return v
-    end
-    local vP, vG = stat(0, 0.24, "Player"), stat(0.24, 0.34, "Game")
-    local vF, vPi, vPl = stat(0.58, 0.12, "FPS"), stat(0.70, 0.15, "Ping"), stat(0.85, 0.15, "Players")
-    task.spawn(function()
-        local ok, inf = pcall(function() return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId) end)
-        vG.Text = (ok and inf and inf.Name) or ("Place " .. tostring(game.PlaceId))
-    end)
-    local frames, acc, fps = 0, 0, 60
-    bind(RunService.RenderStepped, function(dt)
-        frames = frames + 1
-        acc = acc + dt
-        if acc >= 0.5 then fps = math.floor(frames / acc + 0.5) frames, acc = 0, 0 end
-    end)
     task.spawn(function()
         while alive do
-            vP.Text = "@" .. userName()
-            vF.Text = tostring(fps)
-            local ok, ping = pcall(function() return math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue()) end)
-            vPi.Text = ok and (ping .. " ms") or "-"
-            vPl.Text = #Players:GetPlayers() .. "/" .. Players.MaxPlayers
-            task.wait(0.5)
+            pcall(refreshHome)
+            task.wait(1)
         end
     end)
 end
@@ -1210,13 +1954,26 @@ function doInject(auto)
             refreshInjectUI()
             addLog("ERROR", "Injector: " .. injectError)
             notify(T("Inject failed: loadstring unavailable"))
+            if CFG.Discord.SendOnFail then DISC.post("inject_failed") end
             return
+        end
+        if S.backdoorScan then
+            prog(78, "scanning the game for backdoors (Backdoor Mode)...")
+            local hits, scanned = BD.scan(function(f) prog(78 + f * 15) end)
+            BD.lastHits = hits
+            if #hits > 0 then
+                addLog("WARN", "Backdoor Mode: " .. #hits .. " suspicious item(s) found out of " .. scanned .. " scanned (heuristic, check manually)")
+                notify(G("Backdoor Mode: ", "Backdoor Mode: ") .. #hits .. G(" suspicious item(s) found - see Console", " подозрительных объектов - смотри Console"))
+            else
+                addLog("INFO", "Backdoor Mode: no suspicious names or webhook strings found (" .. scanned .. " instances, heuristic only)")
+            end
         end
         prog(100, "ready (" .. ex .. ")")
         task.wait(0.1)
         injected, injecting, injectError = true, false, nil
         refreshInjectUI()
         addLog("INFO", "Injector: injected - Run, Spam and the script catalog are now enabled")
+        if CFG.Discord.SendOnInject then DISC.post("injected") end
         if S.autoExec and runAutoExec then
             task.delay(math.max(0, S.autoDelay or 1), function() runAutoExec() end)
         end
@@ -1354,20 +2111,34 @@ do
         loadTab()
         notify(d < 0 and "Undone" or "Redone")
     end
-    local function ab(name, order, cb) local b = iconBtn(actions, name, 32, cb) b.LayoutOrder = order end
+    local function ab(name, order, cb) local b = iconBtn(actions, name, 32, cb) b.LayoutOrder = order return b end
     ab("undo", 1, function() stepHist(-1) end)
     ab("redo", 2, function() stepHist(1) end)
     ab("copy", 3, function()
         if setclipboard then setclipboard(editorBox.Text) notify("Script copied") else notify("Clipboard not supported") end
     end)
     ab("plus", 4, function() newTab("") loadTab() end)
-    ab("x", 5, function() setOpen(false) end)
 
     local box = new("ScrollingFrame", {
-        Parent = editorPage, Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -96), BackgroundColor3 = C.panel,
+        Parent = editorPage, Position = UDim2.fromOffset(0, 72), Size = UDim2.new(1, 0, 1, -142), BackgroundColor3 = C.panel,
         BorderSizePixel = 0, ScrollBarThickness = 4, AutomaticCanvasSize = Enum.AutomaticSize.XY, CanvasSize = UDim2.new(),
         ScrollingDirection = Enum.ScrollingDirection.XY,
     }, { round(12), stroke() })
+    local crumbRow = new("Frame", { Parent = editorPage, Position = UDim2.fromOffset(0, 40), Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1 })
+    local crumb = txt(crumbRow, "", 12, C.text, Enum.Font.GothamMedium)
+    crumb.Position, crumb.Size = UDim2.fromOffset(4, 0), UDim2.new(1, -130, 1, 0)
+    local injB = makeInjectButton(crumbRow, UDim2.fromOffset(108, 26))
+    injB.b.AnchorPoint, injB.b.Position = Vector2.new(1, 0.5), UDim2.new(1, 0, 0.5, 0)
+    task.spawn(function()
+        while alive do
+            local tb = tabs[activeTab]
+            crumb.Text = tb and tb.name or ""
+            task.wait(0.3)
+        end
+    end)
+    local statusLbl = new("TextLabel", { Parent = editorPage, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -6, 1, -46), Size = UDim2.fromOffset(320, 16),
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.sub, TextXAlignment = Enum.TextXAlignment.Right,
+        Text = "Ln 1, Col 1    Spaces: 4    UTF-8    Luau" })
     lineLabel = new("TextLabel", {
         Parent = box, Position = UDim2.fromOffset(8, 8), Size = UDim2.fromOffset(26, 0), AutomaticSize = Enum.AutomaticSize.Y,
         BackgroundTransparency = 1, TextXAlignment = Enum.TextXAlignment.Right, TextYAlignment = Enum.TextYAlignment.Top,
@@ -1469,6 +2240,7 @@ do
             local cw, lh = metrics()
             local ln, col = lineCol(text, p)
             local x, y = 44 + col * cw, 8 + ln * lh
+            statusLbl.Text = ("Ln %d, Col %d    Spaces: 4    UTF-8    Luau"):format(ln + 1, col + 1)
             blinkT = 0
             caret.BackgroundTransparency = 0
             caret.Size = UDim2.fromOffset(2, lh)
@@ -1535,14 +2307,196 @@ do
     spP.b.LayoutOrder = 4
     refreshInjectUI()
 
+    -- ===== Volt-style file tree (left) + terminal (bottom) =====
+    local TREEW = 168
+    local edMain = new("Frame", { Parent = editorPage, Position = UDim2.fromOffset(TREEW + 8, 0), Size = UDim2.new(1, -(TREEW + 8), 1, 0), BackgroundTransparency = 1 })
+    for _, o in ipairs({ h, crumbRow, box, statusLbl, bar }) do o.Parent = edMain end
+    local tree = new("Frame", { Parent = editorPage, Size = UDim2.new(0, TREEW, 1, 0), BackgroundColor3 = C.panel }, { round(12), stroke() })
+    local srch = new("TextBox", { Parent = tree, Position = UDim2.fromOffset(8, 8), Size = UDim2.new(1, -16, 0, 28), BackgroundColor3 = C.item, TextColor3 = C.text,
+        PlaceholderColor3 = C.sub, PlaceholderText = G("Search files...", "Поиск файлов..."), Font = Enum.Font.Gotham, TextSize = 12, Text = "", ClearTextOnFocus = false,
+        TextXAlignment = Enum.TextXAlignment.Left }, { round(8), new("UIPadding", { PaddingLeft = UDim.new(0, 8) }) })
+    local tl = new("ScrollingFrame", { Parent = tree, Position = UDim2.fromOffset(4, 44), Size = UDim2.new(1, -8, 1, -50), BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new() }, { vlist(2) })
+    local secOpen = { Scripts = true, ["Auto-Execute"] = true, Workspace = false }
+    local lastSig = ""
+    local function wsFiles()
+        local out = {}
+        if not listfiles then return out end
+        local items
+        for _, q in ipairs({ "", "." }) do
+            local ok, r = pcall(listfiles, q)
+            if ok and type(r) == "table" and #r > 0 then items = r break end
+        end
+        for _, f in ipairs(items or {}) do
+            if type(f) == "string" then
+                local path = (string.gsub(f, "\\", "/"))
+                local low = string.lower(path)
+                local okF, isF = pcall(isfolder or function() return false end, path)
+                if not (okF and isF) and (string.sub(low, -4) == ".lua" or string.sub(low, -5) == ".luau" or string.sub(low, -4) == ".txt") then
+                    out[#out + 1] = path
+                end
+            end
+        end
+        table.sort(out)
+        return out
+    end
+    local function treeRender()
+        for _, c in ipairs(tl:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
+        local q = string.lower(srch.Text)
+        local order = 0
+        local function row(depth, text, iconName, cb, bold)
+            order = order + 1
+            local b = new("TextButton", { Parent = tl, LayoutOrder = order, Size = UDim2.new(1, -4, 0, 26), BackgroundColor3 = C.item, BackgroundTransparency = 1,
+                AutoButtonColor = false, Text = "" }, { round(6) })
+            local ic = icon(b, iconName, 12, C.sub)
+            ic.Position = UDim2.fromOffset(6 + depth * 12, 7)
+            local t = txt(b, text, 12, bold and C.text or C.sub, bold and Enum.Font.GothamMedium or Enum.Font.Gotham)
+            t.Position, t.Size, t.TextTruncate = UDim2.fromOffset(24 + depth * 12, 0), UDim2.new(1, -28 - depth * 12, 1, 0), Enum.TextTruncate.AtEnd
+            b.MouseEnter:Connect(function() tween(b, 0.1, { BackgroundTransparency = 0.6 }) end)
+            b.MouseLeave:Connect(function() tween(b, 0.1, { BackgroundTransparency = 1 }) end)
+            b.MouseButton1Click:Connect(cb)
+            return b
+        end
+        local function section(key, label, items)
+            local shown = {}
+            for _, it in ipairs(items) do
+                if q == "" or string.find(string.lower(it.name), q, 1, true) then shown[#shown + 1] = it end
+            end
+            if q ~= "" and #shown == 0 then return end
+            local isOpen = secOpen[key] or q ~= ""
+            row(0, label .. "  " .. #shown, isOpen and "down" or "right", function()
+                secOpen[key] = not secOpen[key]
+                treeRender()
+            end, true)
+            if isOpen then
+                for _, it in ipairs(shown) do row(1, it.name, "code", it.cb) end
+                if #shown == 0 then
+                    local e = row(1, G("(empty)", "(пусто)"), "code", function() end)
+                end
+            end
+        end
+        local scripts, auto = {}, {}
+        for _, sc in ipairs(DB.scripts or {}) do
+            scripts[#scripts + 1] = { name = sc.name, cb = function() openInEditor(sc.name, sc.src) end }
+        end
+        for _, nm in ipairs(type(DB.autoList) == "table" and DB.autoList or {}) do
+            for _, sc in ipairs(DB.scripts or {}) do
+                if sc.name == nm then auto[#auto + 1] = { name = nm, cb = function() openInEditor(sc.name, sc.src) end } break end
+            end
+        end
+        section("Scripts", G("Scripts", "Скрипты"), scripts)
+        section("Auto-Execute", G("Auto-Execute", "Автозапуск"), auto)
+        local ws = {}
+        if secOpen.Workspace or q ~= "" then
+            for _, f in ipairs(wsFiles()) do
+                ws[#ws + 1] = { name = string.match(f, "[^/]+$") or f, cb = function()
+                    local ok, body = pcall(readfile, f)
+                    if ok and type(body) == "string" then openInEditor(string.match(f, "[^/]+$") or f, body) else notify(G("Cannot read the file", "Не удалось прочитать файл")) end
+                end }
+            end
+        end
+        section("Workspace", G("Workspace", "Workspace"), ws)
+    end
+    bind(srch:GetPropertyChangedSignal("Text"), treeRender)
+    treeRender()
+    task.spawn(function()
+        while alive do
+            task.wait(1.5)
+            if currentPage == "Editor" and tree.Visible then
+                local names = {}
+                for _, sc in ipairs(DB.scripts or {}) do names[#names + 1] = sc.name end
+                local sig = table.concat(names, "|") .. "#" .. #(type(DB.autoList) == "table" and DB.autoList or {})
+                if sig ~= lastSig then lastSig = sig treeRender() end
+            end
+        end
+    end)
+    local edLayout
+    local listBtn = ab("list", 0, function()
+        S.treeOpen = not (S.treeOpen ~= false)
+        saveDB()
+        edLayout()
+    end)
+
+    -- terminal under the editor
+    local TERM_H = 104
+    local term = new("Frame", { Parent = edMain, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, -70), Size = UDim2.new(1, 0, 0, TERM_H),
+        BackgroundColor3 = C.panel, Visible = false }, { round(12), stroke() })
+    local th = txt(term, G("Terminal", "Терминал"), 12, C.text, Enum.Font.GothamBold)
+    th.Position, th.Size = UDim2.fromOffset(12, 0), UDim2.fromOffset(120, 24)
+    local clr = new("TextButton", { Parent = term, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 2), Size = UDim2.fromOffset(60, 20), BackgroundTransparency = 1,
+        Text = G("Clear", "Очистить"), Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = C.sub, AutoButtonColor = false })
+    local tlist = new("ScrollingFrame", { Parent = term, Position = UDim2.fromOffset(8, 26), Size = UDim2.new(1, -16, 1, -32), BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new() }, { vlist(1) })
+    local rows = 0
+    local KC = { ERROR = C.err, WARN = C.warn, INFO = C.info }
+    local function addTermRow(e)
+        rows = rows + 1
+        local l = new("TextLabel", { Parent = tlist, LayoutOrder = rows, Size = UDim2.new(1, -4, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 11,
+            TextColor3 = KC[e.k] or C.text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+            Text = "[" .. e.t .. "] " .. string.gsub(e.m, "[\r\n]+", " ") })
+        local kids = tlist:GetChildren()
+        if #kids > 140 then
+            for _, c in ipairs(kids) do if c:IsA("TextLabel") then c:Destroy() break end end
+        end
+        tlist.CanvasPosition = Vector2.new(0, 1e6)
+    end
+    for i = math.max(1, #logs - 30), #logs do addTermRow(logs[i]) end
+    logHooks[#logHooks + 1] = addTermRow
+    bind(clr.MouseButton1Click, function()
+        for _, c in ipairs(tlist:GetChildren()) do if c:IsA("TextLabel") then c:Destroy() end end
+    end)
+    local termBtn = new("TextButton", { Parent = edMain, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 2, 1, -46), Size = UDim2.fromOffset(120, 16), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = C.sub, TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false, Text = "" })
+    local termOn = S.termOpen == true
+    local lastTabStyle = TH.tabStyle
+    function edLayout()
+        local c = TH
+        local treeOn = c.edTree and S.treeOpen ~= false
+        local right = c.treeSide == "right"
+        tree.Visible = treeOn
+        tree.Position = right and UDim2.new(1, -TREEW, 0, 0) or UDim2.fromOffset(0, 0)
+        listBtn.Visible = c.edTree
+        edMain.Position = (treeOn and not right) and UDim2.fromOffset(TREEW + 8, 0) or UDim2.fromOffset(0, 0)
+        edMain.Size = UDim2.new(1, treeOn and -(TREEW + 8) or 0, 1, 0)
+        local topBarOn = c.toolbarPos ~= "bottom"
+        crumbRow.Visible = c.edCrumb
+        if topBarOn then
+            crumbRow.AnchorPoint, crumbRow.Position = Vector2.new(0, 0), UDim2.fromOffset(0, 40)
+        else
+            crumbRow.AnchorPoint, crumbRow.Position = Vector2.new(0, 1), UDim2.new(0, 0, 1, -40)
+        end
+        statusLbl.Visible = c.edStatus
+        term.Visible = termOn
+        termBtn.Text = (termOn and "▾ " or "▸ ") .. G("Terminal", "Терминал")
+        local top = topBarOn and (40 + (c.edCrumb and 32 or 0)) or 40
+        box.Position = UDim2.fromOffset(0, top)
+        box.Size = UDim2.new(1, 0, 1, -(top + 70 + (termOn and (TERM_H + 6) or 0) + ((c.edCrumb and not topBarOn) and 32 or 0)))
+        if lastTabStyle ~= c.tabStyle then
+            lastTabStyle = c.tabStyle
+            if rebuildTabs then pcall(rebuildTabs) end
+        end
+    end
+    bind(termBtn.MouseButton1Click, function()
+        termOn = not termOn
+        S.termOpen = termOn
+        saveDB()
+        edLayout()
+    end)
+    LY.hooks[#LY.hooks + 1] = edLayout
+    edLayout()
+
     function rebuildTabs()
         for _, c in ipairs(tabBar:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
         for i, tb in ipairs(tabs) do
             local on = i == activeTab
+            local flat = TH.tabStyle == "flat"
             local f = new("TextButton", {
-                Parent = tabBar, LayoutOrder = i, Size = UDim2.fromOffset(118, 34), AutoButtonColor = false, Text = "",
-                BackgroundColor3 = on and C.item or C.panel,
-            }, { round(10) })
+                Parent = tabBar, LayoutOrder = i, Size = UDim2.fromOffset(flat and 132 or 118, 34), AutoButtonColor = false, Text = "",
+                BackgroundColor3 = on and C.item or C.panel, BackgroundTransparency = (flat and not on) and 1 or 0,
+            }, { round(flat and 6 or 10) })
+            if flat and on then
+                new("Frame", { Parent = f, AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = C.white, BorderSizePixel = 0 })
+            end
             local l = txt(f, tb.name, 12, on and C.text or C.sub, Enum.Font.GothamMedium)
             l.Position = UDim2.fromOffset(12, 0)
             l.Size = UDim2.new(1, -38, 1, 0)
@@ -2206,6 +3160,161 @@ do
 end
 
 ----------------------------------------------------------------------
+-- AI: a small chat tab backed by the person's own free API key (Gemini or Groq).
+-- No key ships with the script - CFG.AI.ApiKey stays empty; people paste their own
+-- in Settings > AI (saved to DB.ai.key, never sent anywhere but the provider).
+----------------------------------------------------------------------
+local AI = {}
+do
+    local function key() return (type(DB.ai) == "table" and DB.ai.key ~= "" and DB.ai.key) or CFG.AI.ApiKey end
+    local function provider() return (type(DB.ai) == "table" and DB.ai.provider) or CFG.AI.Provider end
+    local function model() return (type(DB.ai) == "table" and DB.ai.model ~= "" and DB.ai.model) or (provider() == "groq" and CFG.AI.GroqModel or CFG.AI.Model) end
+    function AI.ready() return type(key()) == "string" and key() ~= "" end
+    function AI.providerName() return provider() == "groq" and "Groq" or "Gemini" end
+
+    -- history: array of { role = "user"|"model", text = "..." } (role "model" = assistant, matches Gemini's naming)
+    function AI.ask(history, cb)
+        if not AI.ready() then cb(false, G("No API key set. Add one in Settings > AI.", "Нет API-ключа. Добавь его в Settings > AI.")) return end
+        task.spawn(function()
+            local ok, result = pcall(function()
+                if provider() == "groq" then
+                    local msgs = { { role = "system", content = CFG.AI.System } }
+                    for _, m in ipairs(history) do
+                        msgs[#msgs + 1] = { role = (m.role == "model") and "assistant" or "user", content = m.text }
+                    end
+                    local body = HttpService:JSONEncode({ model = model(), messages = msgs, temperature = 0.7 })
+                    local req = request or http_request or (syn and syn.request)
+                    if not req then error("no HTTP request function available in this executor") end
+                    local r = req({ Url = CFG.AI.GroqEndpoint, Method = "POST",
+                        Headers = { ["Content-Type"] = "application/json", ["Authorization"] = "Bearer " .. key() }, Body = body })
+                    local data = HttpService:JSONDecode(r.Body)
+                    if r.StatusCode >= 300 then error((data.error and data.error.message) or ("HTTP " .. tostring(r.StatusCode))) end
+                    return data.choices[1].message.content
+                else
+                    local contents = {}
+                    for _, m in ipairs(history) do
+                        contents[#contents + 1] = { role = m.role, parts = { { text = m.text } } }
+                    end
+                    local body = HttpService:JSONEncode({ contents = contents, systemInstruction = { parts = { { text = CFG.AI.System } } } })
+                    local url = CFG.AI.Endpoint .. model() .. ":generateContent?key=" .. key()
+                    local okPost, respBody = true, nil
+                    local req = request or http_request or (syn and syn.request)
+                    if req then
+                        local r = req({ Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+                        if r.StatusCode >= 300 then error((HttpService:JSONDecode(r.Body).error or {}).message or ("HTTP " .. tostring(r.StatusCode))) end
+                        respBody = r.Body
+                    else
+                        local okG, body2 = pcall(function() return game:HttpPost(url, body, Enum.HttpContentType.ApplicationJson) end)
+                        if not okG then error("no HTTP request function available in this executor") end
+                        respBody = body2
+                    end
+                    local data = HttpService:JSONDecode(respBody)
+                    if not data.candidates or not data.candidates[1] then
+                        error((data.promptFeedback and data.promptFeedback.blockReason and ("blocked: " .. data.promptFeedback.blockReason)) or "empty response")
+                    end
+                    local parts = data.candidates[1].content.parts
+                    local text = ""
+                    for _, pt in ipairs(parts) do text = text .. (pt.text or "") end
+                    return text
+                end
+            end)
+            if ok then cb(true, result) else cb(false, tostring(result)) end
+        end)
+    end
+end
+
+----------------------------------------------------------------------
+-- AI chat page
+----------------------------------------------------------------------
+do
+    local pg = addPage("AI", "bolt")
+    local h, title = header(pg, "AI")
+    local status = txt(h, "", 12, C.sub)
+    status.AnchorPoint = Vector2.new(1, 0)
+    status.Size = UDim2.fromOffset(240, 36)
+    placeRight(status, 0, 4)
+
+    local history = {}
+    local list = new("ScrollingFrame", { Parent = pg, Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -98), BackgroundColor3 = C.panel,
+        BorderSizePixel = 0, ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new() }, { round(14), stroke(), vlist(8), pad(12) })
+
+    local function refreshStatus()
+        status.Text = AI.ready() and (G("Provider: ", "Провайдер: ") .. AI.providerName()) or G("No key - open Settings > AI", "Нет ключа - открой Settings > AI")
+        status.TextColor3 = AI.ready() and C.ok or C.warn
+    end
+    refreshStatus()
+
+    local function bubble(role, text)
+        local isUser = role == "user"
+        local row = new("Frame", { Parent = list, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 })
+        local b = new("Frame", {
+            Parent = row, AnchorPoint = isUser and Vector2.new(1, 0) or Vector2.new(0, 0),
+            Position = isUser and UDim2.new(1, 0, 0, 0) or UDim2.fromOffset(0, 0),
+            Size = UDim2.new(0.82, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundColor3 = isUser and C.white or C.item,
+        }, { round(12), pad(10) })
+        local t = new("TextLabel", {
+            Parent = b, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = isUser and C.black or C.text, TextWrapped = true,
+            TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Text = text,
+        })
+        return row
+    end
+
+    local function scrollDown() task.defer(function() list.CanvasPosition = Vector2.new(0, 1e6) end) end
+    bubble("model", G("Hi! Ask me anything. I run on your own API key, set in Settings > AI.", "Привет! Спрашивай что угодно. Работаю на твоём собственном ключе из Settings > AI."))
+
+    local inputBar = new("Frame", { Parent = pg, AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1 })
+    local box = new("TextBox", {
+        Parent = inputBar, Size = UDim2.new(1, -100, 1, 0), BackgroundColor3 = C.item, TextColor3 = C.text, PlaceholderColor3 = C.sub,
+        PlaceholderText = G("Message...", "Сообщение..."), Font = Enum.Font.Gotham, TextSize = 13, Text = "", ClearTextOnFocus = false,
+        TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, MultiLine = false,
+    }, { round(10), new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }) })
+    local sendP = pill(inputBar, G("Send", "Отпр."), "right", UDim2.fromOffset(88, 36), nil, true)
+    sendP.b.AnchorPoint, sendP.b.Position = Vector2.new(1, 0.5), UDim2.new(1, 0, 0.5, 0)
+
+    local busy = false
+    local function send()
+        if busy then return end
+        local text = (box.Text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if text == "" then return end
+        if not AI.ready() then
+            notify(G("Add an API key first: Settings > AI", "Сначала добавь ключ: Settings > AI"))
+            return
+        end
+        box.Text = ""
+        bubble("user", text)
+        history[#history + 1] = { role = "user", text = text }
+        if #history > 20 then table.remove(history, 1) end
+        scrollDown()
+        busy = true
+        local thinking = bubble("model", G("Thinking...", "Думаю..."))
+        local thinkLbl = thinking:FindFirstChildOfClass("Frame"):FindFirstChildOfClass("TextLabel")
+        AI.ask(history, function(ok, result)
+            busy = false
+            if ok then
+                thinkLbl.Text = result
+                history[#history + 1] = { role = "model", text = result }
+            else
+                thinkLbl.Text = "⚠ " .. result
+                thinkLbl.TextColor3 = C.err
+            end
+            scrollDown()
+        end)
+    end
+    bind(sendP.b.MouseButton1Click, send)
+    bind(box.FocusLost, function(enter) if enter then send() end end)
+    task.spawn(function()
+        while alive do
+            pcall(refreshStatus)
+            task.wait(2)
+        end
+    end)
+end
+
+
+----------------------------------------------------------------------
+----------------------------------------------------------------------
 -- SETTINGS
 ----------------------------------------------------------------------
 local startTour
@@ -2324,10 +3433,10 @@ do
         S.pos = order2[idx % 3 + 1]
         saveDB() applyPosition() posRefresh()
     end)
-    local styleNames = { sm1ler = "SM1LER", mac = "macOS", linux = "Linux" }
+    local styleNames = { win = "Windows", sm1ler = "SM1LER", mac = "macOS", linux = "Linux" }
     local styleRefresh
     styleRefresh = valueBtn(cell(g1, "GUI style"), function() return styleNames[S.guiStyle] or "SM1LER" end, function()
-        local order3 = { "sm1ler", "mac", "linux" }
+        local order3 = { "win", "sm1ler", "mac", "linux" }
         local idx = 1
         for i, o in ipairs(order3) do if o == S.guiStyle then idx = i end end
         S.guiStyle = order3[idx % #order3 + 1]
@@ -2468,8 +3577,12 @@ do
         oc = oc + 1
         local tbar = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, 34), BackgroundTransparency = 1 }, { hlist(8) })
         oc = oc + 1
+        local hintL = txt(scroll, G("Put .theme files into workspace/SM1LER/themes - they are found automatically.", "Положи файлы .theme в workspace/SM1LER/themes - они находятся автоматически."), 12, C.sub)
+        hintL.LayoutOrder, hintL.Size, hintL.TextWrapped = oc, UDim2.new(1, -6, 0, 28), true
+        oc = oc + 1
         local listF = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, { vlist(6) })
 
+        local exportModal
         local function renderList()
             for _, c in ipairs(listF:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
             if #DB.customThemes == 0 then
@@ -2485,7 +3598,7 @@ do
                     { hlist(6, Enum.HorizontalAlignment.Right) })
                 local a = pill(btns, G("Apply", "Применить"), "check", UDim2.fromOffset(112, 30), function() CT.apply(th) end, true)
                 a.b.LayoutOrder = 1
-                local ex = pill(btns, G("Export", "Экспорт"), "copy", UDim2.fromOffset(96, 30), function() CT.export(th) end)
+                local ex = pill(btns, G("Export", "Экспорт"), "copy", UDim2.fromOffset(96, 30), function() exportModal(th) end)
                 ex.b.LayoutOrder = 2
                 local del = iconBtn(btns, "trash", 30)
                 del.LayoutOrder = 3
@@ -2514,19 +3627,120 @@ do
             end
             local go = pill(card, G("Import", "Импорт"), "check", UDim2.fromOffset(100, 34), function() doImport(inp.Text) end, true)
             go.b.AnchorPoint, go.b.Position, go.b.ZIndex = Vector2.new(1, 0), UDim2.new(1, 0, 0, 72), 22
-            local fl = txt(card, G("Found in workspace:", "Найдено в workspace:"), 12, C.sub)
-            fl.Position, fl.Size, fl.ZIndex = UDim2.fromOffset(0, 146), UDim2.new(1, 0, 0, 18), 22
-            local lst = new("ScrollingFrame", { Parent = card, Position = UDim2.fromOffset(0, 168), Size = UDim2.new(1, 0, 1, -168), BackgroundTransparency = 1, BorderSizePixel = 0,
+            -- file browser: folders + theme-compatible files (.realtheme / .json)
+            local cwd = ""
+            if isfolder then
+                if isfolder("SM1LER/themes") then cwd = "SM1LER/themes" elseif isfolder("SM1LER") then cwd = "SM1LER" end
+            end
+            local upB = iconBtn(card, "left", 26)
+            upB.Position, upB.ZIndex = UDim2.fromOffset(0, 146), 22
+            local pathL = txt(card, "", 12, C.sub, Enum.Font.Code)
+            pathL.Position, pathL.Size, pathL.TextTruncate, pathL.ZIndex = UDim2.fromOffset(34, 146), UDim2.new(1, -34, 0, 26), Enum.TextTruncate.AtEnd, 22
+            local lst = new("ScrollingFrame", { Parent = card, Position = UDim2.fromOffset(0, 176), Size = UDim2.new(1, 0, 1, -176), BackgroundTransparency = 1, BorderSizePixel = 0,
                 ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ZIndex = 22 }, { vlist(6) })
-            local files = CT.scan()
-            if #files == 0 then
-                local t = txt(lst, G("No .realtheme files found. Put them into workspace/SM1LER/themes.", "Файлов .realtheme не найдено. Положи их в workspace/SM1LER/themes."), 12, C.sub)
-                t.Size, t.TextWrapped = UDim2.new(1, 0, 0, 34), true
+            local function render()
+                for _, c in ipairs(lst:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
+                pathL.Text = "workspace/" .. cwd
+                local items
+                for _, q in ipairs(cwd == "" and { "", "." } or { cwd }) do
+                    local ok, r = pcall(listfiles, q)
+                    if ok and type(r) == "table" and #r > 0 then items = r break end
+                end
+                local folders, files = {}, {}
+                for _, it in ipairs(items or {}) do
+                    if type(it) == "string" then
+                        local path = string.gsub(it, "\\", "/")
+                        local okF, isF = pcall(isfolder, path)
+                        if okF and isF then
+                            folders[#folders + 1] = path
+                        else
+                            local low = string.lower(path)
+                            if string.sub(low, -6) == ".theme" or string.sub(low, -10) == ".realtheme" or string.sub(low, -5) == ".json" then files[#files + 1] = path end
+                        end
+                    end
+                end
+                table.sort(folders) table.sort(files)
+                local n = 0
+                for _, f in ipairs(folders) do
+                    n = n + 1
+                    local P = pill(lst, "📁 " .. (string.match(f, "[^/]+$") or f), nil, UDim2.new(1, -6, 0, 32), function() cwd = f render() end)
+                    P.b.LayoutOrder = n
+                end
+                for _, f in ipairs(files) do
+                    n = n + 1
+                    local P = pill(lst, string.match(f, "[^/]+$") or f, "paste", UDim2.new(1, -6, 0, 32), function() doImport(f) end, true)
+                    P.b.LayoutOrder = n
+                end
+                if n == 0 then
+                    local t = txt(lst, G("No theme files here (.theme / .realtheme / .json). Open another folder or put files into workspace/SM1LER/themes.", "Здесь нет файлов тем (.theme / .realtheme / .json). Открой другую папку или положи файлы в workspace/SM1LER/themes."), 12, C.sub)
+                    t.Size, t.TextWrapped = UDim2.new(1, -6, 0, 40), true
+                end
             end
-            for i, f in ipairs(files) do
-                local P = pill(lst, string.match(f, "[^/\\]+$") or f, "paste", UDim2.new(1, -6, 0, 32), function() doImport(f) end)
-                P.b.LayoutOrder = i
+            bind(upB.MouseButton1Click, function()
+                cwd = string.match(cwd, "^(.*)/[^/]*$") or ""
+                render()
+            end)
+            if listfiles then render() else
+                local t = txt(lst, G("This executor has no listfiles: type the file name above.", "У этого экзекьютора нет listfiles: введи имя файла выше."), 12, C.sub)
+                t.Size, t.TextWrapped = UDim2.new(1, -6, 0, 34), true
             end
+        end
+
+        function exportModal(e)
+            local card, close = modal(G("Export theme", "Экспорт темы"), 440, 316)
+            local fmt = "sm1ler"
+            local function lab(text, y)
+                local l = txt(card, text, 12, C.sub)
+                l.Position, l.Size, l.ZIndex = UDim2.fromOffset(0, y), UDim2.new(1, 0, 0, 18), 22
+                return l
+            end
+            lab(G("File name (saved to workspace/SM1LER/themes)", "Имя файла (сохранится в workspace/SM1LER/themes)"), 34)
+            local nameB = new("TextBox", { Parent = card, Position = UDim2.fromOffset(0, 54), Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.item, TextColor3 = C.text, Font = Enum.Font.Gotham,
+                TextSize = 13, Text = tostring(e.name), ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 22 },
+                { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+            lab(G("Format", "Формат"), 98)
+            local row = new("Frame", { Parent = card, Position = UDim2.fromOffset(0, 118), Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, ZIndex = 22 }, { hlist(8) })
+            local btns = {}
+            local info = lab("", 160)
+            info.Size, info.TextWrapped, info.TextYAlignment = UDim2.new(1, 0, 0, 44), true, Enum.TextYAlignment.Top
+            local function paint()
+                for k, b in pairs(btns) do
+                    local on = k == fmt
+                    b.BackgroundColor3 = on and C.white or C.item
+                    b:FindFirstChildOfClass("TextLabel").TextColor3 = on and C.black or C.text
+                end
+                info.Text = fmt == "real"
+                    and G("Real-compatible: colors + code colors only. Opens in the Real app.", "Совместимый с Real: только цвета и цвета кода. Открывается в приложении Real.")
+                    or G("SM1LER: everything (background, neon, effects, palette, code colors).", "SM1LER: всё (фон, неон, эффекты, палитра, цвета кода).")
+            end
+            for i, d in ipairs({ { "sm1ler", "SM1LER (.theme)" }, { "real", "Real (.realtheme)" } }) do
+                local b = new("TextButton", { Parent = row, LayoutOrder = i, Size = UDim2.new(0.5, -4, 1, 0), BackgroundColor3 = C.item, AutoButtonColor = false, Text = "", ZIndex = 22 }, { round(9) })
+                local t = txt(b, d[2], 13, C.text, Enum.Font.GothamMedium, Enum.TextXAlignment.Center)
+                t.Size = UDim2.fromScale(1, 1)
+                btns[d[1]] = b
+                b.MouseButton1Click:Connect(function() fmt = d[1] paint() end)
+            end
+            paint()
+            local msg = lab("", 214)
+            msg.TextWrapped, msg.Size = true, UDim2.new(1, 0, 0, 30)
+            local save = pill(card, G("Save file", "Сохранить файл"), "save", UDim2.fromOffset(150, 34), function()
+                local json = CT.encode(e, fmt)
+                if not json then msg.Text, msg.TextColor3 = G("Export failed", "Не удалось экспортировать"), C.err return end
+                local path = CT.writeFile(nameB.Text, json, fmt == "real" and ".realtheme" or ".theme")
+                if path then
+                    msg.Text, msg.TextColor3 = G("Saved: ", "Сохранено: ") .. path, C.ok
+                else
+                    if setclipboard then pcall(setclipboard, json) end
+                    msg.Text, msg.TextColor3 = G("Cannot write files here. JSON copied to clipboard.", "Здесь нельзя писать файлы. JSON скопирован в буфер."), C.warn
+                end
+            end, true)
+            save.b.AnchorPoint, save.b.Position, save.b.ZIndex = Vector2.new(0, 1), UDim2.fromScale(0, 1), 22
+            local copy = pill(card, G("Copy JSON", "Копировать JSON"), "copy", UDim2.fromOffset(150, 34), function()
+                local json = CT.encode(e, fmt)
+                if json and setclipboard then pcall(setclipboard, json) msg.Text, msg.TextColor3 = G("JSON copied.", "JSON скопирован."), C.ok
+                else msg.Text, msg.TextColor3 = G("Clipboard is not available.", "Буфер обмена недоступен."), C.err end
+            end)
+            copy.b.AnchorPoint, copy.b.Position, copy.b.ZIndex = Vector2.new(0, 1), UDim2.new(0, 158, 1, 0), 22
         end
 
         local function createModal()
@@ -2554,7 +3768,9 @@ do
             end
             local save = pill(card, G("Save theme", "Сохранить тему"), "save", UDim2.fromOffset(160, 34), function()
                 local e = CT.saveCurrent(nameB.Text, { kw = norm(kwB, syn.kw), str = norm(strB, syn.str), num = norm(numB, syn.num), comment = norm(cmB, syn.comment), bi = norm(biB, syn.bi) })
-                notify(G("Theme saved: ", "Тема сохранена: ") .. e.name)
+                local jf = CT.encode(e, "sm1ler")
+                local path = jf and CT.writeFile(e.name, jf, ".theme")
+                notify(G("Theme saved: ", "Тема сохранена: ") .. e.name .. (path and ("\n" .. path) or ""))
                 close()
             end, true)
             save.b.Position, save.b.ZIndex = UDim2.fromOffset(0, 274), 22
@@ -2564,9 +3780,175 @@ do
         imp.b.LayoutOrder = 1
         local crt = pill(tbar, G("Create", "Создать"), "plus", UDim2.fromOffset(110, 34), createModal)
         crt.b.LayoutOrder = 2
+        local rsc = pill(tbar, G("Rescan", "Обновить"), "refresh", UDim2.fromOffset(110, 34), function()
+            local n, added = CT.autoScan(false)
+            notify(G("Theme files: ", "Файлов тем: ") .. n .. G(", new: ", ", новых: ") .. added)
+        end)
+        rsc.b.LayoutOrder = 3
         renderList()
     end
 
+    -- branding
+    do
+    -- Backdoor Mode + Discord status webhook
+    do
+    -- AI tab: your own key, saved locally, never bundled with the script
+    do
+        section(G("AI", "ИИ"))
+        DB.ai = type(DB.ai) == "table" and DB.ai or { key = "", provider = "gemini", model = "" }
+        local prow = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 34), BackgroundTransparency = 1 }, { hlist(8) })
+        oc = oc + 1
+        local provBtns = {}
+        local function paintProv()
+            for k, b in pairs(provBtns) do
+                local on = DB.ai.provider == k
+                b.BackgroundColor3 = on and C.white or C.item
+                b:FindFirstChildOfClass("TextLabel").TextColor3 = on and C.black or C.text
+            end
+        end
+        for i, d in ipairs({ { "gemini", "Gemini (Google AI Studio)" }, { "groq", "Groq" } }) do
+            local b = new("TextButton", { Parent = prow, LayoutOrder = i, Size = UDim2.fromOffset(190, 34), BackgroundColor3 = C.item, AutoButtonColor = false, Text = "" }, { round(9) })
+            local t = txt(b, d[2], 13, C.text, Enum.Font.GothamMedium, Enum.TextXAlignment.Center)
+            t.Size = UDim2.fromScale(1, 1)
+            provBtns[d[1]] = b
+            b.MouseButton1Click:Connect(function() DB.ai.provider = d[1] saveDB() paintProv() end)
+        end
+        paintProv()
+
+        local kr = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 36), BackgroundTransparency = 1 })
+        oc = oc + 1
+        local kl = txt(kr, G("API key", "API-ключ"), 12, C.sub)
+        kl.Size = UDim2.fromOffset(64, 36)
+        local keyTb = new("TextBox", { Parent = kr, Position = UDim2.fromOffset(68, 3), Size = UDim2.new(1, -68, 0, 30), BackgroundColor3 = C.item, TextColor3 = C.text,
+            PlaceholderColor3 = C.sub, PlaceholderText = "AIzaSy... / gsk_...", Font = Enum.Font.Code, TextSize = 13, Text = DB.ai.key, ClearTextOnFocus = false,
+            TextXAlignment = Enum.TextXAlignment.Left }, { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+        bind(keyTb.FocusLost, function() DB.ai.key = keyTb.Text saveDB() end)
+
+        local mr = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 36), BackgroundTransparency = 1 })
+        oc = oc + 1
+        local ml = txt(mr, G("Model", "Модель"), 12, C.sub)
+        ml.Size = UDim2.fromOffset(64, 36)
+        local modelTb = new("TextBox", { Parent = mr, Position = UDim2.fromOffset(68, 3), Size = UDim2.new(1, -68, 0, 30), BackgroundColor3 = C.item, TextColor3 = C.text,
+            PlaceholderColor3 = C.sub, PlaceholderText = G("leave empty for the default", "пусто = модель по умолчанию"), Font = Enum.Font.Code, TextSize = 13, Text = DB.ai.model,
+            ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left }, { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+        bind(modelTb.FocusLost, function() DB.ai.model = modelTb.Text saveDB() end)
+
+        local aiHint = txt(scroll, G("Get a free key at aistudio.google.com (Gemini) or console.groq.com (Groq). Saved only on this device, sent only to that provider.",
+            "Бесплатный ключ: aistudio.google.com (Gemini) или console.groq.com (Groq). Хранится только у тебя, уходит только этому провайдеру."), 11, C.sub)
+        oc = oc + 1
+        aiHint.LayoutOrder, aiHint.Size, aiHint.TextWrapped = oc, UDim2.new(1, -6, 0, 42), true
+        oc = oc + 1
+        local testB = pill(scroll, G("Test key", "Проверить ключ"), "bolt", UDim2.fromOffset(170, 32), function()
+            notify(G("Testing...", "Проверяю..."))
+            AI.ask({ { role = "user", text = "Say OK in one word." } }, function(ok, res)
+                notify(ok and (G("Works: ", "Работает: ") .. tostring(res)) or (G("Failed: ", "Ошибка: ") .. tostring(res)))
+            end)
+        end)
+        testB.b.LayoutOrder = oc
+    end
+
+        section(G("Security", "Безопасность"))
+        local rr = rowF(nil, G("Backdoor Mode (scan on inject)", "Backdoor Mode (скан при Inject)"))
+        local on = S.backdoorScan == true
+        local track = new("TextButton", { Parent = rr, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(46, 26),
+            AutoButtonColor = false, Text = "", BackgroundColor3 = on and C.white or C.item }, { round(13) })
+        new("Frame", { Parent = track, AnchorPoint = Vector2.new(0, 0.5), Size = UDim2.fromOffset(20, 20), BorderSizePixel = 0,
+            Position = on and UDim2.new(1, -23, 0.5, 0) or UDim2.new(0, 3, 0.5, 0), BackgroundColor3 = on and C.black or C.sub }, { round(10) })
+        bind(track.MouseButton1Click, function()
+            S.backdoorScan = not S.backdoorScan
+            saveDB()
+            build()
+        end)
+        local hint = txt(scroll, G("Heuristic only: checks instance names and exposed webhook-looking strings already visible to the client. It cannot read the source of scripts it did not inject - a clean result is not proof.",
+            "Эвристика: проверяет имена объектов и похожие на вебхук строки, уже видимые клиенту. Код чужих скриптов прочитать не может - чистый результат не доказательство."), 11, C.sub)
+        oc = oc + 1
+        hint.LayoutOrder, hint.Size, hint.TextWrapped = oc, UDim2.new(1, -6, 0, 42), true
+        if BD.lastHits then
+            oc = oc + 1
+            local rb = pill(scroll, G("View last scan (", "Последний скан (") .. #BD.lastHits .. ")", "terminal", UDim2.fromOffset(220, 32), function()
+                local card = modal(G("Backdoor Mode: last scan", "Backdoor Mode: последний скан"), 480, 320)
+                local lst = new("ScrollingFrame", { Parent = card, Position = UDim2.fromOffset(0, 34), Size = UDim2.new(1, 0, 1, -40), BackgroundTransparency = 1,
+                    BorderSizePixel = 0, ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ZIndex = 22 }, { vlist(4) })
+                if #BD.lastHits == 0 then
+                    local t = txt(lst, G("No suspicious items found.", "Подозрительных объектов не найдено."), 12, C.sub)
+                    t.Size = UDim2.new(1, 0, 0, 24)
+                end
+                for i, h in ipairs(BD.lastHits) do
+                    local t = txt(lst, h.why .. "  ·  " .. h.path, 11, C.text, Enum.Font.Code)
+                    t.LayoutOrder, t.Size, t.TextWrapped = i, UDim2.new(1, -6, 0, 18), true
+                end
+            end)
+            rb.b.LayoutOrder = oc
+        end
+
+        section(G("Discord status webhook", "Статус-вебхук Discord"))
+        local dHint = txt(scroll, G("Posts an embed to your Discord channel when someone injects (name, status, detect status, version). No personal data is sent. Set CFG.Discord.WebhookUrl in the script.",
+            "Отправляет эмбед в твой канал Discord при каждом Inject (название, статус, детект, версия). Личные данные не отправляются. Укажи CFG.Discord.WebhookUrl в скрипте."), 11, C.sub)
+        oc = oc + 1
+        dHint.LayoutOrder, dHint.Size, dHint.TextWrapped = oc, UDim2.new(1, -6, 0, 42), true
+        oc = oc + 1
+        local dState = txt(scroll, DISC.enabled() and G("Webhook: configured ✓", "Вебхук: настроен ✓") or G("Webhook: not set (CFG.Discord.WebhookUrl is empty)", "Вебхук: не задан (CFG.Discord.WebhookUrl пуст)"),
+            12, DISC.enabled() and C.ok or C.sub, Enum.Font.GothamMedium)
+        dState.LayoutOrder, dState.Size = oc, UDim2.new(1, -6, 0, 20)
+        oc = oc + 1
+        local testB = pill(scroll, G("Send test message", "Отправить тест"), "bolt", UDim2.fromOffset(190, 32), function()
+            if not DISC.enabled() then notify(G("Set CFG.Discord.WebhookUrl first", "Сначала укажи CFG.Discord.WebhookUrl")) return end
+            DISC.post("test")
+            notify(G("Sent (check your Discord channel)", "Отправлено (проверь канал Discord)"))
+        end)
+        testB.b.LayoutOrder = oc
+    end
+
+        section(G("Branding", "Брендинг"))
+        oc = oc + 1
+        local bx = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.panel },
+            { round(12), vlist(8), pad(12) })
+        local function boxIn(parent, x, w, default, placeholder)
+            return new("TextBox", { Parent = parent, Position = UDim2.fromOffset(x, 3), Size = UDim2.new(1, -(x + 112), 0, 30), BackgroundColor3 = C.item, TextColor3 = C.text,
+                PlaceholderColor3 = C.sub, PlaceholderText = placeholder, Font = Enum.Font.Gotham, TextSize = 13, Text = default, ClearTextOnFocus = false,
+                TextXAlignment = Enum.TextXAlignment.Left }, { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+        end
+        local function applyBtn(parent, cb)
+            local ap = pill(parent, G("Apply", "Применить"), "check", UDim2.fromOffset(104, 30), cb, true)
+            ap.b.AnchorPoint, ap.b.Position = Vector2.new(1, 0), UDim2.new(1, 0, 0, 3)
+        end
+        local nr = new("Frame", { Parent = bx, LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1 })
+        local nl = txt(nr, G("Name", "Название"), 12, C.sub)
+        nl.Size = UDim2.fromOffset(70, 36)
+        local nameTb = boxIn(nr, 74, 0, CFG.Name, BR.defaultName)
+        applyBtn(nr, function()
+            local n, ok = BR.setName(nameTb.Text)
+            nameTb.Text = n
+            if ok then notify(G("Name changed: ", "Название изменено: ") .. n) else notify(G("Name must be 3-14 characters", "Название: от 3 до 14 символов")) end
+        end)
+        local lr = new("Frame", { Parent = bx, LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1 })
+        local ll = txt(lr, G("Logo", "Логотип"), 12, C.sub)
+        ll.Size = UDim2.fromOffset(70, 36)
+        BR.addLogo(new("TextLabel", { Parent = lr, Position = UDim2.fromOffset(74, 2), Size = UDim2.fromOffset(32, 32), BackgroundColor3 = C.white, Text = "S",
+            Font = Enum.Font.GothamBlack, TextSize = 16, TextColor3 = C.black }, { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) }))
+        local logoTb = boxIn(lr, 114, 0, (DB.brand.vectorLogo and "bolt") or DB.brand.imgSpec or DB.brand.logo or "S", "S  |  bolt  |  rbxassetid://123  |  logo.png")
+        applyBtn(lr, function()
+            local ok, err = BR.setLogo(logoTb.Text)
+            if ok then notify(G("Logo updated", "Логотип обновлён")) else notify(err) end
+        end)
+        local genB = pill(lr, G("Generated bolt", "Сген. молния"), "bolt", UDim2.fromOffset(150, 30), function()
+            BR.setLogo("bolt")
+            logoTb.Text = "bolt"
+            notify(G("Logo updated: generated bolt mark", "Логотип: сгенерированная молния"))
+        end)
+        genB.b.AnchorPoint, genB.b.Position = Vector2.new(1, 0), UDim2.new(1, -112, 0, 3)
+        local hint = txt(bx, G("Logo: type \"bolt\" for a generated vector mark (drawn in-engine, no external image), 1-2 characters/emoji, an image id (rbxassetid://...) or a .png/.jpg file from the workspace folder. The name changes everywhere in the interface.",
+            "Логотип: напиши \"bolt\" для сгенерированного векторного значка (рисуется движком, без внешней картинки), 1-2 символа/эмодзи, id картинки (rbxassetid://...) или файл .png/.jpg из папки workspace. Название меняется во всём интерфейсе."), 11, C.sub)
+        hint.LayoutOrder, hint.Size, hint.TextWrapped = 3, UDim2.new(1, 0, 0, 56), true
+        hint.TextYAlignment = Enum.TextYAlignment.Top
+        local rst = pill(bx, G("Reset branding", "Сбросить бренд"), "refresh", UDim2.fromOffset(170, 32), function()
+            BR.setName(BR.defaultName)
+            BR.setLogo("")
+            nameTb.Text, logoTb.Text = CFG.Name, "S"
+            notify(G("Branding reset", "Бренд сброшен"))
+        end)
+        rst.b.LayoutOrder = 4
+    end
     genv.__SM1LER_applyFps = applyFps
 end
 
@@ -2649,11 +4031,11 @@ end
 ----------------------------------------------------------------------
 -- Top "S" button, hotkey, dragging
 ----------------------------------------------------------------------
-topBtn = new("TextButton", {
+topBtn = BR.addLogo(new("TextButton", {
     Parent = gui, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 6), Size = UDim2.fromOffset(40, 40),
     BackgroundColor3 = C.bg, AutoButtonColor = false, Text = "S", Font = Enum.Font.GothamBlack, TextSize = 22,
     TextColor3 = C.white, Visible = false, ZIndex = 60, -- shown after the key is accepted
-}, { round(20), stroke() })
+}, { round(20), stroke() }))
 local movedBtn = false
 bind(topBtn.MouseButton1Click, function()
     if movedBtn then movedBtn = false return end
@@ -2696,6 +4078,161 @@ end
 -- THEME (full background + neon customization)
 ----------------------------------------------------------------------
 ----------------------------------------------------------------------
+-- PALETTES: a theme can recolour the whole UI (C + every existing element)
+----------------------------------------------------------------------
+local PALS, curPal = {}, "default"
+local PAL = { keys = { "bg", "panel", "item", "hover", "line", "text", "sub", "white", "ok", "warn", "err", "info" } }
+do
+    local base = {}
+    for k, v in pairs(C) do base[k] = v end
+    PALS.default = base
+    local function rgb(r, g, b) return Color3.fromRGB(r, g, b) end
+    -- Volt: flat neutral greys (#111111 / #171717 / #242424 / #262626, text #cccccc)
+    PALS.volt = { bg = rgb(17, 17, 17), panel = rgb(23, 23, 23), item = rgb(36, 36, 36), hover = rgb(52, 52, 52), line = rgb(38, 38, 38),
+        text = rgb(204, 204, 204), sub = rgb(163, 163, 163), white = rgb(229, 229, 229), black = base.black, ok = rgb(16, 185, 129), warn = rgb(234, 179, 8), err = rgb(239, 68, 68), info = base.info }
+end
+-- full colour table of a palette; "custom" = TH.palCustom on top of the default one (every colour kept unique)
+local function palTarget(name)
+    if name ~= "custom" then return PALS[name] or PALS.default end
+    local t = {}
+    for k, v in pairs(PALS.default) do
+        local h = TH.palCustom and TH.palCustom[k]
+        t[k] = (type(h) == "string" and hexToColor(h)) or v
+    end
+    local seen = { t.black }
+    local function taken(c) for _, o in ipairs(seen) do if o == c then return true end end return false end
+    for _, k in ipairs(PAL.keys) do
+        local c, tries = t[k], 0
+        while taken(c) and tries < 255 do
+            tries = tries + 1
+            c = Color3.fromRGB(math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), (math.floor(c.B * 255 + 0.5) + 1) % 256)
+        end
+        t[k] = c
+        seen[#seen + 1] = c
+    end
+    return t
+end
+local function setPalette(name)
+    if not (name == "custom" or PALS[name]) then name = "default" end
+    local new, old, keys = palTarget(name), {}, {}
+    for k, v in pairs(C) do old[k] = v end
+    for k, v in pairs(new) do if old[k] ~= v then keys[#keys + 1] = k end end
+    curPal = name
+    if #keys == 0 then return end
+    for _, k in ipairs(keys) do C[k] = new[k] end
+    local function map(c)
+        for _, k in ipairs(keys) do if c == old[k] then return new[k] end end
+        return nil
+    end
+    for _, d in ipairs(gui:GetDescendants()) do
+        if d:IsA("GuiObject") then
+            local m = map(d.BackgroundColor3)
+            if m then d.BackgroundColor3 = m end
+            if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+                local t = map(d.TextColor3)
+                if t then d.TextColor3 = t end
+                if d:IsA("TextBox") then
+                    local pc = map(d.PlaceholderColor3)
+                    if pc then d.PlaceholderColor3 = pc end
+                end
+            elseif d:IsA("ImageLabel") or d:IsA("ImageButton") then
+                local ic = map(d.ImageColor3)
+                if ic then d.ImageColor3 = ic end
+            end
+        elseif d:IsA("UIStroke") then
+            local m = map(d.Color)
+            if m then d.Color = m end
+        end
+    end
+end
+-- edit one colour of the interface (switches the theme to the custom palette)
+function PAL.set(key, hexstr)
+    if not hexToColor(hexstr) then return false end
+    if TH.pal ~= "custom" then
+        TH.palCustom = {}
+        for _, k in ipairs(PAL.keys) do TH.palCustom[k] = hex(C[k]) end
+        TH.pal = "custom"
+    end
+    TH.palCustom[key] = hexstr
+    if key == "bg" then TH.mode, TH.color = "color", hexstr end   -- the window background follows the "Window" colour
+    setPalette("custom")
+    return true
+end
+function PAL.reset()
+    TH.pal, TH.palCustom = nil, nil
+    setPalette("default")
+end
+
+----------------------------------------------------------------------
+-- INTERFACE STYLE: corner radius, border width, font family, text size
+----------------------------------------------------------------------
+local STY = { fonts = { "Gotham", "Builder Sans", "Source Sans", "Ubuntu", "Roboto", "Nunito" } }
+do
+    local FAM = {
+        ["Builder Sans"] = { Gotham = "BuilderSans", GothamMedium = "BuilderSansMedium", GothamSemibold = "BuilderSansMedium", GothamBold = "BuilderSansBold", GothamBlack = "BuilderSansExtraBold" },
+        ["Source Sans"] = { Gotham = "SourceSans", GothamMedium = "SourceSansSemibold", GothamSemibold = "SourceSansSemibold", GothamBold = "SourceSansBold", GothamBlack = "SourceSansBold" },
+        Ubuntu = { all = "Ubuntu" }, Roboto = { all = "Roboto" }, Nunito = { all = "Nunito" },
+    }
+    local KEEP = { Code = true, RobotoMono = true }   -- code font is never touched (editor alignment)
+    local DEFAULT_KEY = "1|1|Gotham|1"
+    local lastKey, skip, pending = DEFAULT_KEY, {}, false
+    local function curKey()
+        return table.concat({ tostring(TH.radius or 1), tostring(TH.borderScale or 1), tostring(TH.font or "Gotham"), tostring(TH.textScale or 1) }, "|")
+    end
+    local function rebuildSkip()
+        skip = {}
+        for _, n in ipairs(FX.neon) do if n.st then skip[n.st] = true end end
+    end
+    local function styleOne(d)
+        if d:IsA("UICorner") then
+            local cr = d.CornerRadius
+            if cr.Scale ~= 0 then return end
+            local r0 = d:GetAttribute("r0")
+            if r0 == nil then r0 = cr.Offset d:SetAttribute("r0", r0) end
+            d.CornerRadius = UDim.new(0, math.floor(r0 * (TH.radius or 1) + 0.5))
+        elseif d:IsA("UIStroke") then
+            if skip[d] then return end
+            local t0 = d:GetAttribute("t0")
+            if t0 == nil then t0 = d.Thickness d:SetAttribute("t0", t0) end
+            d.Thickness = t0 * (TH.borderScale or 1)
+        elseif d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+            local f0 = d:GetAttribute("f0")
+            if f0 == nil then
+                f0 = d.Font.Name
+                d:SetAttribute("f0", f0)
+                d:SetAttribute("s0", d.TextSize)
+            end
+            if KEEP[f0] then return end
+            local s0 = d:GetAttribute("s0") or d.TextSize
+            local fam = FAM[TH.font or "Gotham"]
+            local nf = (fam and (fam.all or fam[f0])) or f0
+            pcall(function() d.Font = Enum.Font[nf] end)
+            d.TextSize = math.max(8, math.floor(s0 * (TH.textScale or 1) + 0.5))
+        end
+    end
+    function STY.apply()
+        if pending then return end
+        pending = true
+        task.delay(0.12, function()
+            pending = false
+            local k = curKey()
+            if k == lastKey then return end
+            lastKey = k
+            rebuildSkip()
+            for _, d in ipairs(gui:GetDescendants()) do pcall(styleOne, d) end
+        end)
+    end
+    bind(gui.DescendantAdded, function(d)
+        if lastKey == DEFAULT_KEY then return end
+        task.defer(function()
+            if not d.Parent then return end
+            if d:IsA("UIStroke") then rebuildSkip() end
+            pcall(styleOne, d)
+        end)
+    end)
+end
+
+----------------------------------------------------------------------
 -- VOLT theme extras: silver light sweeps running along the window edges
 ----------------------------------------------------------------------
 local VT = { on = false }
@@ -2735,11 +4272,16 @@ end
 local NY = { on = false, was = false }
 do
     local W = WIN_W
+    local bulbs, ptxt, nyText = {}, nil, nil
     local COLS = { Color3.fromRGB(255, 70, 85), Color3.fromRGB(255, 205, 80), Color3.fromRGB(90, 220, 130), Color3.fromRGB(90, 170, 255), Color3.fromRGB(255, 120, 200) }
     local WIRE = Color3.fromRGB(16, 70, 40)
     local deco = new("Frame", { Parent = win, AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromOffset(0, 6), Size = UDim2.fromOffset(W, 74),
         BackgroundTransparency = 1, ZIndex = 60, Visible = false })
     local function wireY(x) return 52 + 13 * math.sin(math.pi * ((x % 100) / 100)) end
+    local function buildDeco()
+    W = WIN_W
+    deco.Size = UDim2.fromOffset(W, 74)
+    deco:ClearAllChildren()
     -- wire (sagging swags)
     for x = 0, W - 20, 20 do
         local x2 = x + 20
@@ -2749,7 +4291,7 @@ do
             Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy) + 1, 2), Rotation = math.deg(math.atan2(dy, dx)), BackgroundColor3 = WIRE, BorderSizePixel = 0, ZIndex = 61 })
     end
     -- bulbs
-    local bulbs = {}
+    bulbs = {}
     for k = 1, 19 do
         local x = k * 35
         local y = wireY(x)
@@ -2768,9 +4310,9 @@ do
     end
     local plaque = new("Frame", { Parent = deco, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromOffset(W / 2, 4), Size = UDim2.fromOffset(272, 30),
         BackgroundColor3 = Color3.fromRGB(8, 14, 12), BackgroundTransparency = 0.1, BorderSizePixel = 0, ZIndex = 64 }, { round(15), neonStroke(1.5, 40) })
-    local ptxt = txt(plaque, "", 12, Color3.fromRGB(255, 226, 150), Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    ptxt = txt(plaque, "", 12, Color3.fromRGB(255, 226, 150), Enum.Font.GothamBold, Enum.TextXAlignment.Center)
     ptxt.Size, ptxt.ZIndex = UDim2.fromScale(1, 1), 65
-    local function nyText()
+    function nyText()
         local now = os.time()
         local d = os.date("*t", now)
         if d.month == 1 and d.day <= 7 then
@@ -2782,6 +4324,11 @@ do
             math.floor(left % 86400 / 3600), math.floor(left % 3600 / 60), left % 60)
     end
     ptxt.Text = nyText()
+    end
+    buildDeco()
+    NY.rebuild = buildDeco
+    local lastW = WIN_W
+    LY.hooks[#LY.hooks + 1] = function() if WIN_W ~= lastW then lastW = WIN_W buildDeco() end end
 
     -- glyph snowflakes inside the window
     local fl = new("Frame", { Parent = content, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ClipsDescendants = true, BorderSizePixel = 0, ZIndex = 18, Visible = false },
@@ -2806,7 +4353,7 @@ do
         local d = acc
         acc = 0
         tClock = tClock + d
-        fl.Visible = S.snow ~= false
+        fl.Visible = true   -- the snowflakes belong to the New Year theme
         if fl.Visible then
             for _, f in ipairs(flakes) do
                 f.y = f.y + f.sp * d
@@ -2861,6 +4408,7 @@ local imgMsgLbl
 local lastPanelAlpha = 0
 
 function applyTheme()
+    setPalette(TH.pal)
     local mode = TH.mode
     for _, L in ipairs({ bgC, sbBg }) do
         local g = L:FindFirstChildOfClass("UIGradient")
@@ -2905,6 +4453,11 @@ function applyTheme()
     lastPanelAlpha = a
     NY.set(TH.special == "newyear")
     VT.set(TH.special == "volt")
+    STY.apply()
+    if LY.apply then
+        local okL, errL = pcall(LY.apply, false)
+        if not okL then warn("[layout] " .. tostring(errL)) end
+    end
 end
 bind(content.DescendantAdded, function(d)
     if TH.panelAlpha ~= 0 and d:IsA("GuiObject") and d.BackgroundColor3 == C.panel and d.BackgroundTransparency == 0 then
@@ -3037,9 +4590,19 @@ local function pickColor(initial, cb)
     sync()
 end
 
+local function applyThemeBrand()
+    if type(TH.brandName) == "string" and TH.brandName ~= "" then BR.setName(TH.brandName) end
+    if type(TH.brandLogo) == "string" and TH.brandLogo ~= "" then BR.setLogo(TH.brandLogo) end
+end
 local THEME_PRESETS = {
-    { G("⚡ Volt", "⚡ Volt"), { mode = "gradient", g1 = "#0c0c0e", g2 = "#171719", g3 = "#0f0f11", angle = 160, neonA = "#f0f0f5", neonB = "#6f6f78",
-        rainbow = false, neonSpeed = 38, neonThick = 1.5, panelAlpha = 0.1, special = "volt" },
+    -- layout presets: the original SM1LER window and a top-navigation variant (any layout can be built in Theme > Layout)
+    { G("🧩 SM1LER Classic", "🧩 SM1LER Classic"), { brandName = "SM1LER", brandLogo = "S", winW = 700, winH = 372, sbPos = "left", sbW = 58, sbLabels = false, sbSplit = true, sbGap = 10, sbFooter = false, sbCollapse = false,
+        titleBar = false, ctrlLoc = "header", edTree = false, edCrumb = false, edStatus = false, tabStyle = "pill", radius = 1.3,
+        home = { account = true, plan = true, license = true, version = true, exec = true, news = false } } },
+    { G("📑 Top bar", "📑 Верхняя панель"), { winW = 820, winH = 430, sbPos = "top", sbLabels = true, sbSplit = false, sbFooter = false, sbCollapse = false,
+        titleBar = true, ctrlLoc = "title", edTree = false, edCrumb = true, edStatus = true, tabStyle = "flat", radius = 0.8 } },
+    { G("⚡ Volt", "⚡ Volt"), { brandName = "Volt", brandLogo = "bolt", mode = "color", color = "#111111", g3 = "", neonA = "#3a3a3a", neonB = "#262626",
+        rainbow = false, neonSpeed = 1, neonThick = 1, panelAlpha = 0, pal = "volt", radius = 0.6, borderScale = 1, font = "Builder Sans", textScale = 1 },
       { kw = "#C586C0", str = "#CE9178", num = "#B5CEA8", comment = "#5E6878", bi = "#DCDCAA" } },
     { G("🎄 New Year", "🎄 Новый год"), { mode = "gradient", g1 = "#040a1c", g2 = "#0b3d2e", g3 = "#6b0f24", angle = 150, neonA = "#ffd76a", neonB = "#ff4d5e",
         rainbow = false, neonSpeed = 45, neonThick = 2, panelAlpha = 0.22, special = "newyear" } },
@@ -3064,15 +4627,34 @@ do
     end
 
     -- converts a Real (.realtheme) table or an SM1LER theme table into { name, th, syn, note }
+    local function num01(v, fb) return (type(v) == "number" and v >= 0 and v <= 1) and v or fb end
     function CT.fromReal(d)
         if type(d) ~= "table" then return nil, G("This is not a theme file", "Это не файл темы") end
         local e = { name = tostring(d.name or "Imported theme") }
+        local extra = {}
+        if type(d.windowCornerRadius) == "number" then extra.radius = math.clamp(d.windowCornerRadius / 10, 0, 2) end
+        if type(d.windowBorderWidth) == "number" then extra.borderScale = math.clamp(d.windowBorderWidth, 0, 3) end
+        if type(d.windowBorderColor) == "string" and hexToColor(d.windowBorderColor) then extra.neonA, extra.neonB = d.windowBorderColor, d.windowBorderColor end
+        if type(d.windowBorderRainbow) == "boolean" then extra.rainbow = d.windowBorderRainbow end
+        if type(d.watermark) == "boolean" then extra.watermark = d.watermark end
+        if type(d.showTitlebarVersion) == "boolean" then extra.showTitleVersion = d.showTitlebarVersion end
+        if type(d.showLogoIcon) == "boolean" then extra.logoIcon = d.showLogoIcon end
+        if type(d.showLogoText) == "boolean" then extra.logoText = d.showLogoText end
+        if d.navLabelMode == "icon-only" then extra.navLabelMode = "icon" elseif d.navLabelMode == "text-only" then extra.navLabelMode = "text" elseif d.navLabelMode == "both" then extra.navLabelMode = "both" end
+        if d.explorerSide == "right" or d.explorerSide == "left" then extra.treeSide = d.explorerSide end
+        if d.toolbarPosition == "top" or d.toolbarPosition == "bottom" then extra.toolbarPos = d.toolbarPosition end
+        if d.navPosition == "top" or d.navPosition == "left" or d.navPosition == "right" then extra.sbPos = d.navPosition end
+        if type(d.uiGridEnabled) == "boolean" then extra.uiGrid = d.uiGridEnabled end
+        if type(d.colorfulIcons) == "boolean" then extra.colorfulIcons = d.colorfulIcons end
+        if type(d.bgUrl) == "string" and d.bgUrl ~= "" then extra.mode, extra.image = "image", d.bgUrl end
+        if type(d.bgOpacity) == "number" then extra.imgAlpha = 1 - math.clamp(d.bgOpacity, 0, 1) end
+        if type(d.bgStrength) == "number" then extra.dim = math.clamp(d.bgStrength, 0, 1) end
         if type(d.th) == "table" then
             e.th, e.syn = d.th, d.syn
             return e
         end
         local th = {}
-        for k, v in pairs(TD) do th[k] = v end
+        for k, v in pairs(TD) do th[k] = cpv(v) end
         local ct = d.customTheme
         if type(ct) == "table" and (ct.bg or ct.surface) then
             local tk = type(ct.tokens) == "table" and ct.tokens or {}
@@ -3107,6 +4689,7 @@ do
                 if next(syn) then e.syn = syn end
             end
         end
+        for k, v in pairs(extra) do th[k] = v end
         e.th = th
         return e
     end
@@ -3121,9 +4704,13 @@ do
     end
 
     function CT.apply(e)
-        TH.special = nil
-        for k, v in pairs(TD) do TH[k] = v end
-        for k, v in pairs(e.th or {}) do TH[k] = v end
+        TH.special, TH.pal, TH.palCustom = nil, nil, nil
+        for k, v in pairs(TD) do TH[k] = cpv(v) end
+        for k, v in pairs(e.th or {}) do
+            if type(v) == "table" then local cp = {} for a, b in pairs(v) do cp[a] = b end v = cp end
+            TH[k] = v
+        end
+        applyThemeBrand()
         resetSyntax()
         if e.syn then setSyntax(e.syn) end
         DB.activeCustom, DB.activeSyn = e.name, e.syn
@@ -3139,8 +4726,10 @@ do
         name = trim(name)
         if name == "" then name = "My theme" end
         local th = {}
-        for k in pairs(TD) do th[k] = TH[k] end
-        th.special = TH.special
+        for k in pairs(TD) do th[k] = cpv(TH[k]) end
+        th.special, th.pal = TH.special, TH.pal
+        th.brandName, th.brandLogo = CFG.Name, (DB.brand.vectorLogo and "bolt") or DB.brand.imgSpec or DB.brand.logo or "S"
+        if TH.palCustom then th.palCustom = {} for a, b in pairs(TH.palCustom) do th.palCustom[a] = b end end
         local e = { name = name, th = th, syn = syn or getSyntax() }
         CT.store(e)
         DB.activeCustom, DB.activeSyn = name, e.syn
@@ -3182,6 +4771,51 @@ do
         return true
     end
 
+    -- finds our own .theme files and keeps them in the theme list (file = source of truth)
+    function CT.discover()
+        local out, seen = {}, {}
+        if not listfiles then return out end
+        for _, folder in ipairs({ "SM1LER/themes", "SM1LER", "." }) do
+            local ok, files = pcall(listfiles, folder)
+            if ok and type(files) == "table" then
+                for _, f in ipairs(files) do
+                    if type(f) == "string" then
+                        local path = (string.gsub(f, "\\", "/"))
+                        if string.lower(string.sub(path, -6)) == ".theme" and not seen[path] then
+                            seen[path] = true
+                            out[#out + 1] = path
+                        end
+                    end
+                end
+            end
+        end
+        return out
+    end
+    function CT.autoScan(announce)
+        pcall(function()
+            if makefolder and isfolder then
+                if not isfolder("SM1LER") then makefolder("SM1LER") end
+                if not isfolder("SM1LER/themes") then makefolder("SM1LER/themes") end
+            end
+        end)
+        local files = CT.discover()
+        DB.customThemes = type(DB.customThemes) == "table" and DB.customThemes or {}
+        local added = 0
+        for _, f in ipairs(files) do
+            local e = CT.readFile(f)
+            if e then
+                local existed = false
+                for _, x in ipairs(DB.customThemes) do if x.name == e.name then existed = true break end end
+                CT.store(e)
+                if not existed then added = added + 1 end
+            end
+        end
+        if CT.refreshList then CT.refreshList() end
+        if announce and added > 0 then
+            notify(G("Found ", "Найдено ") .. added .. G(" new .theme file(s). Open Settings > Custom themes.", " новых файлов .theme. Открой Settings > Custom themes."))
+        end
+        return #files, added
+    end
     function CT.scan()
         local out, seen = {}, {}
         if not listfiles then return out end
@@ -3197,6 +4831,44 @@ do
             end
         end
         return out
+    end
+
+    -- Real-app compatible theme (colors + code colors only)
+    function CT.toReal(e)
+        local th, syn = e.th or {}, e.syn or {}
+        local rules = {}
+        for k, token in pairs({ kw = "keyword", str = "string", num = "number", comment = "comment", bi = "function" }) do
+            if syn[k] then rules[#rules + 1] = { token = token, foreground = (string.gsub(syn[k], "#", "")) } end
+        end
+        local sj = HttpService:JSONEncode({ base = "vs-dark", inherit = true, rules = rules, colors = {} })
+        local pc = th.palCustom or {}
+        local volt = th.pal == "volt"
+        local bg = pc.bg or (th.mode == "color" and th.color) or th.g1 or "#111111"
+        return { ["$app"] = "Real", name = e.name,
+            customTheme = { id = "c" .. string.lower((string.gsub(e.name, "[^%w]", ""))), name = e.name, bg = bg,
+                surface = pc.panel or (volt and "#171717") or th.g2 or bg, text = pc.text or "#cccccc",
+                accent = pc.white or th.neonA or "#ffffff", tokens = { accent2 = th.neonB or th.neonA or "#ffffff",
+                    border = pc.line or (volt and "#262626") or nil, bg3 = pc.item or (volt and "#242424") or nil } },
+            customSyntaxTheme = { name = e.name, json = sj } }
+    end
+    function CT.encode(e, fmt)
+        local data = fmt == "real" and CT.toReal(e) or { ["$app"] = "SM1LER", ["$version"] = 1, name = e.name, th = e.th, syn = e.syn }
+        local ok, json = pcall(function() return HttpService:JSONEncode(data) end)
+        return ok and json or nil
+    end
+    function CT.writeFile(name, json, ext)
+        if not writefile then return nil end
+        pcall(function()
+            if makefolder and isfolder then
+                if not isfolder("SM1LER") then makefolder("SM1LER") end
+                if not isfolder("SM1LER/themes") then makefolder("SM1LER/themes") end
+            end
+        end)
+        local clean = string.gsub(tostring(name), "[^%w%-_ ]", "_")
+        if clean == "" then clean = "theme" end
+        local path = "SM1LER/themes/" .. clean .. (ext or ".theme")
+        if pcall(writefile, path, json) then return path end
+        return nil
     end
 
     function CT.export(e)
@@ -3304,17 +4976,33 @@ do
             f.AnchorPoint, f.Position = Vector2.new(1, 0.5), UDim2.new(1, -12, 0.5, 0)
         end
         local pct = function(v) return math.floor(v * 100 + 0.5) .. "%" end
+        local function palRow(key, label)
+            local r = rowF(nil, label)
+            local sw = new("TextButton", { Parent = r, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(30, 30),
+                AutoButtonColor = false, Text = "", BackgroundColor3 = C[key] }, { round(8), stroke(C.line) })
+            local box = new("TextBox", { Parent = r, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -46, 0.5, 0), Size = UDim2.fromOffset(96, 30),
+                BackgroundColor3 = C.item, TextColor3 = C.text, Font = Enum.Font.Code, TextSize = 13, Text = hex(C[key]), ClearTextOnFocus = false }, { round(8) })
+            local function refresh() sw.BackgroundColor3, box.Text = C[key], hex(C[key]) end
+            local function setHex(hs) if PAL.set(key, hs) then refresh() commit() end end
+            bind(box.FocusLost, function()
+                local t = string.lower(string.gsub(box.Text, "%s", ""))
+                if string.sub(t, 1, 1) ~= "#" then t = "#" .. t end
+                if hexToColor(t) then setHex(t) else refresh() end
+            end)
+            bind(sw.MouseButton1Click, function() pickColor(hex(C[key]), setHex) end)
+        end
 
         section("Presets")
         local pg = new("Frame", { Parent = scroll, LayoutOrder = nxt(), Size = UDim2.new(1, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 },
             { new("UIGridLayout", { CellSize = UDim2.new(1 / 3, -6, 0, 34), CellPadding = UDim2.fromOffset(8, 8), SortOrder = Enum.SortOrder.LayoutOrder }) })
         for i, p in ipairs(THEME_PRESETS) do
             local P = pill(pg, p[1], nil, UDim2.new(), function()
-                TH.rainbow, TH.special = false, nil
-                TH.panelAlpha, TH.neonSpeed, TH.neonThick = TD.panelAlpha, TD.neonSpeed, TD.neonThick
-                for k, v in pairs(p[2]) do TH[k] = v end
+                for k, v in pairs(TD) do TH[k] = cpv(v) end   -- a theme replaces the whole configuration
+                TH.rainbow, TH.special, TH.pal, TH.palCustom = false, nil, nil, nil
+                for k, v in pairs(p[2]) do TH[k] = cpv(v) end
                 if p[2].g3 == nil then TH.g3 = "" end
                 DB.activeCustom, DB.activeSyn = nil, nil
+                applyThemeBrand()
                 resetSyntax()
                 if p[3] then setSyntax(p[3]) DB.activeSyn = p[3] end
                 refreshCode()
@@ -3373,6 +5061,91 @@ do
 
         sliderRow(nil, "Panel transparency", 0, 0.85, 0.05, function() return TH.panelAlpha end, function(v) TH.panelAlpha = v end, pct)
 
+        local function tgl(label, getter, setter)
+            local rr = rowF(nil, label)
+            local on = getter()
+            local track = new("TextButton", { Parent = rr, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(46, 26),
+                AutoButtonColor = false, Text = "", BackgroundColor3 = on and C.white or C.item }, { round(13) })
+            new("Frame", { Parent = track, AnchorPoint = Vector2.new(0, 0.5), Size = UDim2.fromOffset(20, 20), BorderSizePixel = 0,
+                Position = on and UDim2.new(1, -23, 0.5, 0) or UDim2.new(0, 3, 0.5, 0), BackgroundColor3 = on and C.black or C.sub }, { round(10) })
+            bind(track.MouseButton1Click, function()
+                setter(not getter())
+                commit()
+                build()
+            end)
+        end
+        local num = function(v) return tostring(v) end
+
+        section(G("Layout: window", "Раскладка: окно"))
+        sliderRow(nil, G("Window width", "Ширина окна"), 560, 1100, 10, function() return TH.winW end, function(v) TH.winW = v end, num)
+        sliderRow(nil, G("Window height", "Высота окна"), 340, 600, 10, function() return TH.winH end, function(v) TH.winH = v end, num)
+        tgl(G("Title bar", "Строка заголовка"), function() return TH.titleBar == true end, function(v) TH.titleBar = v end)
+        sliderRow(nil, G("Title bar height", "Высота заголовка"), 28, 48, 2, function() return TH.titleH end, function(v) TH.titleH = v end, num)
+        chipRow({ "title", "header" }, TH.ctrlLoc, function(it) TH.ctrlLoc = it commit() build() end)
+        chipRow({ "win", "sm1ler", "mac", "linux" }, S.guiStyle, function(it) S.guiStyle = it saveDB() applyGuiStyle() build() end)
+
+        section(G("Layout: sidebar", "Раскладка: боковая панель"))
+        chipRow({ "left", "right", "top" }, TH.sbPos, function(it) TH.sbPos = it commit() build() end)
+        chipRow({ "flat", "card" }, TH.sbSplit and "card" or "flat", function(it) TH.sbSplit = (it == "card") commit() build() end)
+        sliderRow(nil, G("Sidebar width", "Ширина панели"), 48, 260, 4, function() return TH.sbW end, function(v) TH.sbW = v end, num)
+        sliderRow(nil, G("Gap (card mode)", "Отступ (режим карточек)"), 0, 20, 1, function() return TH.sbGap end, function(v) TH.sbGap = v end, num)
+        tgl(G("Menu labels", "Подписи в меню"), function() return TH.sbLabels == true end, function(v) TH.sbLabels = v end)
+        tgl(G("User card", "Карточка пользователя"), function() return TH.sbFooter == true end, function(v) TH.sbFooter = v end)
+        tgl(G("Collapse button", "Кнопка сворачивания"), function() return TH.sbCollapse == true end, function(v) TH.sbCollapse = v end)
+
+        section(G("Layout: editor", "Раскладка: редактор"))
+        tgl(G("File tree", "Дерево файлов"), function() return TH.edTree == true end, function(v) TH.edTree = v end)
+        tgl(G("Tab name + Inject row", "Строка вкладки + Inject"), function() return TH.edCrumb == true end, function(v) TH.edCrumb = v end)
+        tgl(G("Status line", "Строка состояния"), function() return TH.edStatus == true end, function(v) TH.edStatus = v end)
+        chipRow({ "flat", "pill" }, TH.tabStyle, function(it) TH.tabStyle = it commit() build() end)
+
+        section(G("Layout: home cards", "Раскладка: карточки главной"))
+        for _, hk in ipairs({ { "account", G("Account", "Аккаунт") }, { "plan", G("Plan", "Тариф") }, { "license", G("License + time", "Лицензия + время") },
+            { "status", G("Status", "Статус") }, { "version", G("Version", "Версия") }, { "exec", G("Executor", "Экзекьютор") }, { "news", G("What's new", "Что нового") } }) do
+            tgl(hk[2], function() return not (type(TH.home) == "table" and TH.home[hk[1]] == false) end,
+                function(v) TH.home = type(TH.home) == "table" and TH.home or {} TH.home[hk[1]] = v end)
+        end
+
+        section(G("Layout: menu pages", "Раскладка: страницы меню"))
+        for _, pn in ipairs({ "Home", "Editor", "Scripts", "Console", "AI", "Account", "Info" }) do
+            tgl(G("Show ", "Показывать ") .. pn, function() return not (type(TH.navOff) == "table" and TH.navOff[pn] == true) end,
+                function(v) TH.navOff = type(TH.navOff) == "table" and TH.navOff or {} TH.navOff[pn] = (not v) or nil end)
+        end
+
+        section(G("Layout: extras", "Раскладка: дополнительно"))
+        chipRow({ "icon", "text", "both" }, TH.navLabelMode, function(it) TH.navLabelMode = it commit() build() end)
+        chipRow({ "left", "right" }, TH.treeSide, function(it) TH.treeSide = it commit() build() end)
+        chipRow({ "top", "bottom" }, TH.toolbarPos, function(it) TH.toolbarPos = it commit() build() end)
+        tgl(G("Colorful menu icons", "Цветные иконки меню"), function() return TH.colorfulIcons == true end, function(v) TH.colorfulIcons = v end)
+        tgl(G("Title bar version", "Версия в заголовке"), function() return TH.showTitleVersion == true end, function(v) TH.showTitleVersion = v end)
+        tgl(G("Show logo icon", "Показывать значок"), function() return TH.logoIcon ~= false end, function(v) TH.logoIcon = v end)
+        tgl(G("Show logo text (name)", "Показывать текст (название)"), function() return TH.logoText ~= false end, function(v) TH.logoText = v end)
+        tgl(G("Watermark", "Водяной знак"), function() return TH.watermark == true end, function(v) TH.watermark = v end)
+        tgl(G("Faint grid background", "Фоновая сетка"), function() return TH.uiGrid == true end, function(v) TH.uiGrid = v end)
+        sliderRow(nil, G("Panel depth (shadow)", "Глубина панелей (тень)"), 0, 3, 1, function() return TH.panelDepth end, function(v) TH.panelDepth = v end, num)
+
+        section(G("Interface", "Интерфейс"))
+        sliderRow(nil, G("Corner radius", "Скругление углов"), 0, 2, 0.1, function() return TH.radius end, function(v) TH.radius = v end, pct)
+        sliderRow(nil, G("Border width", "Толщина рамок"), 0, 3, 0.5, function() return TH.borderScale end, function(v) TH.borderScale = v end, pct)
+        sliderRow(nil, G("Text size", "Размер текста"), 0.85, 1.2, 0.05, function() return TH.textScale end, function(v) TH.textScale = v end, pct)
+        chipRow({ STY.fonts[1], STY.fonts[2], STY.fonts[3] }, TH.font, function(it) TH.font = it commit() build() end)
+        chipRow({ STY.fonts[4], STY.fonts[5], STY.fonts[6] }, TH.font, function(it) TH.font = it commit() build() end)
+
+        section(G("Palette (recolors the whole interface)", "Палитра (перекрашивает весь интерфейс)"))
+        for _, k in ipairs(PAL.keys) do
+            palRow(k, ({ bg = G("Window", "Окно"), panel = G("Panels", "Панели"), item = G("Items / inputs", "Элементы / поля"), hover = G("Hover", "Наведение"),
+                line = G("Borders", "Границы"), text = G("Text", "Текст"), sub = G("Secondary text", "Второй текст"), white = G("Accent / buttons", "Акцент / кнопки"),
+                ok = G("Success", "Успех"), warn = G("Warning", "Предупреждение"), err = G("Error", "Ошибка"), info = G("Info", "Инфо") })[k])
+        end
+        do
+            local rp = pill(scroll, G("Reset palette", "Сбросить палитру"), "refresh", UDim2.fromOffset(170, 34), function()
+                PAL.reset()
+                commit()
+                build()
+            end)
+            rp.b.LayoutOrder = nxt()
+        end
+
         section("Neon border")
         do
             local rr = rowF(nil, "Rainbow neon")
@@ -3397,7 +5170,8 @@ do
     build()
 
     local resetP = pill(h, "Reset", "refresh", UDim2.fromOffset(100, 32), function()
-        for k, v in pairs(TD) do TH[k] = v end
+        for k, v in pairs(TD) do TH[k] = cpv(v) end
+        TH.special, TH.pal, TH.palCustom = nil, nil, nil
         bgI.Image = ""
         commit()
         build()
@@ -3411,7 +5185,7 @@ end
 -- INJECT status bar on Home ----------------------------------------------
 do
     local pg = pages.Home
-    local bar = new("Frame", { Parent = pg, Position = UDim2.fromOffset(0, 278), Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = C.panel }, { round(14), stroke() })
+    local bar = new("Frame", { Parent = pg, AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = C.panel }, { round(14), stroke() })
     local dot = new("Frame", { Parent = bar, Position = UDim2.fromOffset(16, 18), Size = UDim2.fromOffset(10, 10), BackgroundColor3 = C.err, BorderSizePixel = 0 }, { round(5) })
     local lbl = txt(bar, "", 13, C.text, Enum.Font.GothamMedium)
     lbl.Position, lbl.Size = UDim2.fromOffset(36, 0), UDim2.new(1, -210, 1, 0)
@@ -3422,6 +5196,11 @@ do
         elseif injected then lbl.Text, dot.BackgroundColor3 = G("Injector: injected - scripts can run", "Инжектор: подключён - скрипты можно запускать"), C.ok
         elseif injectError then lbl.Text, dot.BackgroundColor3 = G("Injector failed: cannot run code here (see Console)", "Ошибка инжектора: здесь нельзя запускать код (см. Console)"), C.err
         else lbl.Text, dot.BackgroundColor3 = G("Injector: not injected - press INJECT", "Инжектор: не подключён - нажми INJECT"), C.err end
+    end
+    INJ.hooks[#INJ.hooks + 1] = function()
+        if injecting then TBAR.lbl.Text, TBAR.dot.BackgroundColor3 = G("Attaching...", "Подключение..."), C.warn
+        elseif injected then TBAR.lbl.Text, TBAR.dot.BackgroundColor3 = G("Injected", "Подключён"), C.ok
+        else TBAR.lbl.Text, TBAR.dot.BackgroundColor3 = G("Not injected", "Не подключён"), C.err end
     end
     refreshInjectUI()
 end
@@ -3653,143 +5432,6 @@ do
 end
 
 ----------------------------------------------------------------------
--- UPDATER · components · auto-update
--- Hosting: put a small JSON file online (e.g. GitHub raw) and set CFG.Update.ManifestUrl:
---   {"version":"1.0.1","url":"https://raw.githubusercontent.com/<you>/<repo>/main/SM1LER_client.lua"}
--- When version is higher than CFG.Version, this script downloads the new build ONCE, saves it
--- to the SM1LER folder and runs it. Old copies of the script start the saved newer build directly.
-----------------------------------------------------------------------
-local UPD = {}
-do
-    local U = CFG.Update
-    local function vparts(v)
-        local t = {}
-        for n in string.gmatch(tostring(v or "0"), "%d+") do t[#t + 1] = tonumber(n) end
-        return t
-    end
-    function UPD.newer(a, b)
-        local x, y = vparts(a), vparts(b)
-        for i = 1, math.max(#x, #y) do
-            local p, q = x[i] or 0, y[i] or 0
-            if p ~= q then return p > q end
-        end
-        return false
-    end
-    local function path(n) return U.Folder .. "/" .. n end
-    local function filesOk() return (writefile and readfile and isfile) and true or false end
-    local function httpGet(url)
-        local ok, body = pcall(function() return game:HttpGet(url) end)
-        if ok and type(body) == "string" and #body > 0 then return body end
-        local req = request or http_request or (syn and syn.request)
-        if req then
-            local ok2, r = pcall(req, { Url = url, Method = "GET" })
-            if ok2 and type(r) == "table" and r.StatusCode == 200 and type(r.Body) == "string" and #r.Body > 0 then return r.Body end
-        end
-        return nil
-    end
-    function UPD.enabled() return type(U.ManifestUrl) == "string" and U.ManifestUrl ~= "" end
-
-    -- saved build: returns version, source
-    function UPD.cached()
-        if not filesOk() then return nil end
-        local ok, v, src = pcall(function()
-            if isfile(path("version.txt")) and isfile(path("client.lua")) then
-                return (string.gsub(readfile(path("version.txt")), "%s+", "")), readfile(path("client.lua"))
-            end
-        end)
-        if ok and type(v) == "string" and v ~= "" and type(src) == "string" and #src > 1000 then return v, src end
-        return nil
-    end
-
-    function UPD.remote()
-        if not UPD.enabled() then return nil end
-        local sep = string.find(U.ManifestUrl, "?", 1, true) and "&" or "?"
-        local body = httpGet(U.ManifestUrl .. sep .. "t=" .. os.time())
-        if not body then return nil end
-        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-        if ok and type(data) == "table" and data.version and ((data.url and data.url ~= "") or U.ScriptUrl ~= "") then
-            return { version = tostring(data.version), url = (data.url and data.url ~= "") and data.url or U.ScriptUrl }
-        end
-        return nil
-    end
-
-    -- downloads a build and saves it; returns ok, source
-    function UPD.install(m, cb)
-        cb = cb or function() end
-        cb(0.1)
-        local src = httpGet(m.url)
-        cb(0.8)
-        if not src or #src < 1000 then return false end
-        local okc, fn = pcall(function() return loadstring(src) end)
-        if not okc or type(fn) ~= "function" then return false end   -- corrupt / 404 page: never save it
-        if filesOk() then
-            pcall(function()
-                if makefolder and isfolder and not isfolder(U.Folder) then makefolder(U.Folder) end
-                writefile(path("client.lua"), src)
-                writefile(path("version.txt"), m.version)
-            end)
-        end
-        cb(1)
-        return true, src
-    end
-
-    -- makes sure the injector data exists locally (downloads only when missing)
-    function UPD.ensure(progress)
-        progress = progress or function() end
-        progress(0.05, G("Checking components", "Проверка компонентов"))
-        if not UPD.enabled() or not filesOk() then
-            progress(1, G("Components ready", "Компоненты готовы"))
-            return true
-        end
-        if UPD.cached() then
-            progress(1, G("Components ready", "Компоненты готовы"))
-            return true
-        end
-        progress(0.2, G("Contacting server", "Подключение к серверу"))
-        local m = UPD.remote()
-        if not m then
-            progress(1, G("Server unreachable, will retry later", "Сервер недоступен, повторю позже"))
-            return false
-        end
-        local ok = UPD.install(m, function(p) progress(0.2 + 0.75 * p, G("Downloading injector data", "Загрузка данных инжектора")) end)
-        progress(1, ok and G("Components ready", "Компоненты готовы") or G("Download failed, will retry later", "Загрузка не удалась, повторю позже"))
-        return ok and true or false
-    end
-
-    function UPD.launch(src, ver)
-        local okc, fn = pcall(function() return loadstring(src) end)
-        if not okc or type(fn) ~= "function" then return false end
-        genv.__SM1LER_launched = ver
-        task.spawn(fn)   -- the new build tears this one down at its very top
-        return true
-    end
-
-    -- called at boot: returns true when a newer build was started (this instance must stop)
-    function UPD.boot(cb)
-        genv.__SM1LER_upd_n = genv.__SM1LER_upd_n or 0
-        if genv.__SM1LER_upd_n >= 3 then return false end   -- loop guard
-        cb(G("Checking for updates", "Проверка обновлений"), 0.2)
-        local cv, csrc = UPD.cached()
-        local newestLocal = (cv and UPD.newer(cv, CFG.Version)) and cv or CFG.Version
-        local m = UPD.enabled() and UPD.remote() or nil
-        if m and UPD.newer(m.version, newestLocal) then
-            genv.__SM1LER_upd_n = genv.__SM1LER_upd_n + 1
-            cb(G("Downloading update ", "Загрузка обновления ") .. m.version, 0.4)
-            local ok, src = UPD.install(m, function(p) cb(G("Downloading update ", "Загрузка обновления ") .. m.version, 0.4 + 0.5 * p) end)
-            if ok then
-                cb(G("Starting version ", "Запуск версии ") .. m.version, 1)
-                if UPD.launch(src, m.version) then return true end
-            end
-        elseif cv and UPD.newer(cv, CFG.Version) then
-            genv.__SM1LER_upd_n = genv.__SM1LER_upd_n + 1
-            cb(G("Starting version ", "Запуск версии ") .. cv, 1)
-            if UPD.launch(csrc, cv) then return true end
-        end
-        return false
-    end
-end
-
-----------------------------------------------------------------------
 -- KEY SYSTEM · LOADER · INTRO · EXPIRY
 ----------------------------------------------------------------------
 local function fitScale(w, h)
@@ -3890,7 +5532,7 @@ local function openGate(mode, message)
     local root = new("Frame", { Parent = gui, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, ZIndex = 300, Active = true })
     local grp = new("CanvasGroup", { Parent = root, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, GroupTransparency = 1 })
     GT.root, GT.grp = root, grp
-    makeSnow(grp, 90, 5).always = true
+    makeSnow(grp, 90, 5)
     tw2(grp, 0.35, { GroupTransparency = 0 })
 
     local GW, GH = 480, 440
@@ -3901,8 +5543,8 @@ local function openGate(mode, message)
     local card = new("Frame", { Parent = box, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(6, 6, 8), BorderSizePixel = 0, ClipsDescendants = true },
         { round(22), neonStroke(2, 50) })
 
-    new("TextLabel", { Parent = card, Position = UDim2.fromOffset(22, 18), Size = UDim2.fromOffset(40, 40), BackgroundColor3 = C.white, Text = "S",
-        Font = Enum.Font.GothamBlack, TextSize = 24, TextColor3 = Color3.new(0, 0, 0) }, { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) })
+    BR.addLogo(new("TextLabel", { Parent = card, Position = UDim2.fromOffset(22, 18), Size = UDim2.fromOffset(40, 40), BackgroundColor3 = C.white, Text = "S",
+        Font = Enum.Font.GothamBlack, TextSize = 24, TextColor3 = Color3.new(0, 0, 0) }, { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) }))
     local title = txt(card, CFG.Name, 20, C.text, Enum.Font.GothamBold)
     title.Position, title.Size = UDim2.fromOffset(72, 16), UDim2.fromOffset(240, 24)
     local sub = txt(card, G("Key system · choose a service · keys last 1 / 5 / 12 hours", "Ключ-система · выбери сервис · ключи на 1 / 5 / 12 часов"), 12, C.sub)
@@ -4266,7 +5908,8 @@ local function openGate(mode, message)
     ------------------------------------------------------------------
     -- apply / key panel
     ------------------------------------------------------------------
-    local function apply(key, exp)
+    local function apply(key, exp, tier)
+        if tier then DB.planTier = tier end
         activateKey(key, exp)
         setStatus(G("Key accepted.", "Ключ принят."), C.ok)
         local m = mode
@@ -4281,8 +5924,8 @@ local function openGate(mode, message)
     end
 
     local function verifyTyped()
-        local ok, a, formatted = validateKey(keyIn.Text)
-        if ok then apply(formatted, a) return end
+        local ok, a, formatted, tier = validateKey(keyIn.Text)
+        if ok then apply(formatted, a, tier) return end
         local msgs = {
             expired = G("This key has expired.", "Срок действия этого ключа истёк."),
             clock = G("This key looks issued in the future. Check your clock.", "Ключ выдан «в будущем». Проверь время."),
@@ -4313,8 +5956,8 @@ local function openGate(mode, message)
         copyP.b.LayoutOrder = 1
         local actP = gpill(brow, "Activate", "Активировать", "check", UDim2.fromOffset(150, 34), function()
             if not newKey then return end
-            local ok, a, formatted = validateKey(newKey)
-            if ok then apply(formatted, a) else setStatus(G("Could not activate. Start again.", "Не удалось активировать. Начни заново."), C.err) end
+            local ok, a, formatted, tier = validateKey(newKey)
+            if ok then apply(formatted, a, tier) else setStatus(G("Could not activate. Start again.", "Не удалось активировать. Начни заново."), C.err) end
         end, true)
         actP.b.LayoutOrder = 2
         if newKey and setclipboard then pcall(setclipboard, newKey) end
@@ -4668,6 +6311,14 @@ task.spawn(function()
     end
     step(G("Loading settings", "Загрузка настроек"), 0.3, 0.3)
     pcall(restoreSession)
+    task.spawn(function() pcall(CT.autoScan, true) end)
+    task.spawn(function()
+        while alive do
+            pcall(STAT.refresh)
+            task.wait(90)
+        end
+    end)
+    pcall(LY.apply, false)
     -- auto-update: starts a newer saved/downloaded build and stops this one
     do
         local okU, launched = pcall(UPD.boot, function(msg, p) splash.status(msg) splash.progress(p) end)
@@ -4681,8 +6332,9 @@ task.spawn(function()
     step(G("Checking key", "Проверка ключа"), 0.6, 0.3)
     local valid, exp, reason = false, nil, nil
     if type(DB.key) == "string" then
-        local ok, a, formatted = validateKey(DB.key)
+        local ok, a, formatted, tier = validateKey(DB.key)
         if ok then valid, exp, DB.key = true, a, formatted
+            if tier then DB.planTier = tier end
         else
             DB.key = nil
             if a == "expired" then reason = G("Your key has expired. Get a new one below.", "Срок действия ключа истёк. Получи новый ниже.") end
