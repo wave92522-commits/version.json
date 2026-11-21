@@ -27,7 +27,7 @@ local CFG = {
     File = "sm1ler_data.json",
     HubApi = "https://scriptblox.com/api/script/",
     MaxLoad = 3.5,               -- loading screen never lasts longer than this (seconds)
-    Version = "1.9.2",           -- bump this on every release (and in version.json on your host)
+    Version = "2.0.2",           -- bump this on every release (and in version.json on your host)
     Update = {
         ManifestUrl = "https://raw.githubusercontent.com/wave92522-commits/version.json/main/version.json",        -- e.g. https://raw.githubusercontent.com/<you>/<repo>/main/version.json  (empty = updater off)
         ScriptUrl = "",          -- optional fallback if version.json has no "url"
@@ -70,12 +70,22 @@ local CFG = {
     },
     -- Discord: posts an embed to a webhook on inject / failure. Leave WebhookUrl empty to turn this off.
     Discord = {
-        WebhookUrl = "",             -- https://discord.com/api/webhooks/.../...
+        WebhookUrl = "https://discord.com/api/webhooks/1572270230590193775/-eZaIY1B0cPcrXVvKsU6APbSuvZ5TVEj_azEceIE1EImKEnse3iH3gdaaImcFOtAUuLk",
         SendOnInject = true,
         SendOnFail = true,
         AvatarUrl = "",
     },
+    -- Owner accounts (Roblox usernames, case-insensitive): get the OWNER plan (a key that never expires,
+    -- skips the key-system screens) and the Panel tab. Add more names to the list as needed.
+    Owners = { "Araen684999" },
 }
+local function isOwner()
+    for _, n in ipairs(CFG.Owners) do
+        if string.lower(n) == string.lower(LP.Name) then return true end
+    end
+    return false
+end
+
 
 local function netGet(url)
     local ok, body = pcall(function() return game:HttpGet(url) end)
@@ -259,7 +269,7 @@ local function G(en, ru) return S.lang == "ru" and ru or en end
 
 ----------------------------------------------------------------------
 UPD = {}
-local ok_blk1, err_blk1 = pcall(function()
+;(function() local ok, err = pcall(function()
     local U = CFG.Update
     local function vparts(v)
         local t = {}
@@ -382,7 +392,7 @@ local ok_blk1, err_blk1 = pcall(function()
         end
         return false
     end
-end) if not ok_blk1 then warn("[blk1] " .. tostring(err_blk1)) end
+end) if not ok then warn("[blk1] " .. tostring(err)) end end)()
 
 
 ----------------------------------------------------------------------
@@ -407,7 +417,8 @@ end
 -- to a webhook (Settings > Advanced, or CFG.Discord.WebhookUrl). No personal data is sent.
 ----------------------------------------------------------------------
 DISC = {}
-function DISC.enabled() return type(CFG.Discord.WebhookUrl) == "string" and string.find(CFG.Discord.WebhookUrl, "^https?://") ~= nil end
+function DISC.url() return (type(DB.panel) == "table" and DB.panel.webhookUrl ~= "" and DB.panel.webhookUrl) or CFG.Discord.WebhookUrl end
+function DISC.enabled() return type(DISC.url()) == "string" and string.find(DISC.url(), "^https?://") ~= nil end
 function DISC.post(event)
     if not DISC.enabled() then return end
     task.spawn(function()
@@ -428,8 +439,32 @@ function DISC.post(event)
         end)
         local payload = { username = CFG.Name, avatar_url = (CFG.Discord.AvatarUrl ~= "" and CFG.Discord.AvatarUrl) or nil, embeds = { embed } }
         local ok, json = pcall(function() return HttpService:JSONEncode(payload) end)
-        if ok then netPost(CFG.Discord.WebhookUrl, json) end
+        if ok then netPost(DISC.url(), json) end
     end)
+end
+-- posts a formatted changelog/update announcement as plain content (so @everyone / role mentions actually ping)
+-- a = { title, tagline, signature, bullets = {"...", "..."}, linkLabel, link, everyone = bool, roleId = "123..." }
+function DISC.announce(a)
+    if not DISC.enabled() then return false, G("No webhook set", "Вебхук не задан") end
+    local lines = {}
+    local mention = ""
+    if a.everyone then mention = mention .. "@everyone " end
+    if type(a.roleId) == "string" and a.roleId ~= "" then mention = mention .. "<@&" .. a.roleId .. "> " end
+    lines[#lines + 1] = "**" .. tostring(a.title or (CFG.Name .. " v" .. CFG.Version)) .. "**" .. (mention ~= "" and (" " .. mention) or "")
+    if type(a.tagline) == "string" and a.tagline ~= "" then lines[#lines + 1] = "\"" .. a.tagline .. "\"" end
+    if type(a.signature) == "string" and a.signature ~= "" then lines[#lines + 1] = "— " .. a.signature end
+    lines[#lines + 1] = ""
+    for _, b in ipairs(a.bullets or {}) do
+        if tostring(b) ~= "" then lines[#lines + 1] = "- " .. tostring(b) end
+    end
+    if type(a.link) == "string" and a.link ~= "" then
+        lines[#lines + 1] = (type(a.linkLabel) == "string" and a.linkLabel ~= "" and a.linkLabel or G("Download", "Скачать")) .. ": " .. a.link
+    end
+    local content = table.concat(lines, "\n")
+    local ok, json = pcall(function() return HttpService:JSONEncode({ username = CFG.Name, avatar_url = (CFG.Discord.AvatarUrl ~= "" and CFG.Discord.AvatarUrl) or nil, content = content }) end)
+    if not ok then return false, "encode failed" end
+    local sent = netPost(DISC.url(), json)
+    return sent and true or false, content
 end
 
 ----------------------------------------------------------------------
@@ -439,7 +474,7 @@ end
 -- it can already see. Treat a hit as "worth a manual look", not proof of a backdoor.
 ----------------------------------------------------------------------
 BD = {}
-local ok_blk2, err_blk2 = pcall(function()
+;(function() local ok, err = pcall(function()
     local SUS_NAMES = { "backdoor", "rce", "exploit", "grab", "hwid", "crash", "kill_all", "killall", "infect", "payload", "dupe", "ban_", "banall" }
     local WEBHOOK_PAT = "discordapp%.com/api/webhooks"
     local WEBHOOK_PAT2 = "discord%.com/api/webhooks"
@@ -474,7 +509,114 @@ local ok_blk2, err_blk2 = pcall(function()
         progress(1)
         return hits, scanned
     end
-end) if not ok_blk2 then warn("[blk2] " .. tostring(err_blk2)) end
+end) if not ok then warn("[blk2] " .. tostring(err)) end end)()
+
+----------------------------------------------------------------------
+-- GH: publishes version.json (version / status / detectStatus / changelog) straight to
+-- GitHub from the Panel tab, using the GitHub REST API and a personal access token.
+-- Nothing here ships with the script - the token is typed in by the owner and kept
+-- only in their own local DB (DB.panel.ghToken), sent only to api.github.com.
+----------------------------------------------------------------------
+local GH = {}
+;(function()
+    local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    function GH.b64encode(data)
+        return ((data:gsub(".", function(x)
+            local r, b = "", x:byte()
+            for i = 8, 1, -1 do r = r .. (b % 2 ^ i - b % 2 ^ (i - 1) > 0 and "1" or "0") end
+            return r
+        end) .. "0000"):gsub("%d%d%d?%d?%d?%d?", function(x)
+            if #x < 6 then return "" end
+            local c = 0
+            for i = 1, 6 do c = c + (x:sub(i, i) == "1" and 2 ^ (6 - i) or 0) end
+            return B64:sub(c + 1, c + 1)
+        end) .. ({ "", "==", "=" })[#data % 3 + 1])
+    end
+    function GH.b64decode(data)
+        data = string.gsub(data, "[^" .. B64 .. "=]", "")
+        return (data:gsub(".", function(x)
+            if x == "=" then return "" end
+            local r, f = "", (B64:find(x) - 1)
+            for i = 6, 1, -1 do r = r .. (f % 2 ^ i - f % 2 ^ (i - 1) > 0 and "1" or "0") end
+            return r
+        end):gsub("%d%d%d?%d?%d?%d?%d?%d?", function(x)
+            if #x ~= 8 then return "" end
+            local c = 0
+            for i = 1, 8 do c = c + (x:sub(i, i) == "1" and 2 ^ (8 - i) or 0) end
+            return string.char(c)
+        end))
+    end
+
+    local function cfg() return type(DB.panel) == "table" and DB.panel or {} end
+    function GH.ready()
+        local c = cfg()
+        return c.ghOwner and c.ghOwner ~= "" and c.ghRepo and c.ghRepo ~= "" and c.ghToken and c.ghToken ~= "" and c.ghPath and c.ghPath ~= ""
+    end
+    local function api(path)
+        local c = cfg()
+        return "https://api.github.com/repos/" .. c.ghOwner .. "/" .. c.ghRepo .. "/contents/" .. c.ghPath .. (path or "")
+    end
+    local function req()
+        return request or http_request or (syn and syn.request)
+    end
+
+    -- fetches the current version.json (decoded table) + its git "sha" (needed to update it)
+    function GH.getFile()
+        if not GH.ready() then return nil, G("Fill in owner / repo / token / path first", "Сначала заполни owner / repo / токен / путь") end
+        local r = req()
+        if not r then return nil, G("This executor has no HTTP request function", "У этого экзекьютора нет функции HTTP-запроса") end
+        local c = cfg()
+        local ok, resp = pcall(r, {
+            Url = api("?ref=" .. (c.ghBranch ~= "" and c.ghBranch or "main")), Method = "GET",
+            Headers = { ["Authorization"] = "token " .. c.ghToken, ["Accept"] = "application/vnd.github+json", ["User-Agent"] = CFG.Name },
+        })
+        if not ok then return nil, tostring(resp) end
+        if resp.StatusCode == 404 then return { sha = nil, data = {} } end
+        if resp.StatusCode >= 300 then return nil, "GitHub GET " .. tostring(resp.StatusCode) .. ": " .. tostring(resp.Body) end
+        local okj, body = pcall(function() return HttpService:JSONDecode(resp.Body) end)
+        if not okj then return nil, "bad GitHub response" end
+        local okd, decoded = pcall(GH.b64decode, (string.gsub(body.content or "", "\n", "")))
+        local okj2, data = (okd and pcall(function() return HttpService:JSONDecode(decoded) end)) or false, nil
+        return { sha = body.sha, data = (okj2 and data) or {} }
+    end
+
+    -- writes `data` (a table) as version.json back to GitHub (creates the file if it didn't exist)
+    function GH.putFile(data, message)
+        if not GH.ready() then return false, G("Fill in owner / repo / token / path first", "Сначала заполни owner / repo / токен / путь") end
+        local r = req()
+        if not r then return false, G("This executor has no HTTP request function", "У этого экзекьютора нет функции HTTP-запроса") end
+        local got, err = GH.getFile()
+        if not got then return false, err end
+        local c = cfg()
+        local okj, json = pcall(function() return HttpService:JSONEncode(data) end)
+        if not okj then return false, "encode failed" end
+        local payload = { message = message or (G("Update ", "Обновление ") .. tostring(data.version or "")), content = GH.b64encode(json), branch = (c.ghBranch ~= "" and c.ghBranch or "main") }
+        if got.sha then payload.sha = got.sha end
+        local okp, jsonp = pcall(function() return HttpService:JSONEncode(payload) end)
+        if not okp then return false, "encode failed" end
+        local ok, resp = pcall(r, {
+            Url = api(), Method = "PUT",
+            Headers = { ["Authorization"] = "token " .. c.ghToken, ["Content-Type"] = "application/json", ["Accept"] = "application/vnd.github+json", ["User-Agent"] = CFG.Name },
+            Body = jsonp,
+        })
+        if not ok then return false, tostring(resp) end
+        if resp.StatusCode >= 300 then return false, "GitHub PUT " .. tostring(resp.StatusCode) .. ": " .. tostring(resp.Body) end
+        return true
+    end
+
+    -- convenience: pushes the current version / status / detectStatus / changelog, keeping any other
+    -- existing fields in the file untouched (e.g. "url" used by the auto-updater)
+    function GH.publishStatus(changelog)
+        local got, err = GH.getFile()
+        if not got then return false, err end
+        local data = got.data or {}
+        data.version = CFG.Version
+        data.status = STAT.status
+        data.detectStatus = STAT.detect
+        if changelog then data.changelog = changelog end
+        return GH.putFile(data, G("Update status/changelog to v", "Обновление статуса/чейнджлога до v") .. CFG.Version)
+    end
+end)()
 
 local function hexToColor(h)
     h = string.gsub(tostring(h or ""), "#", "")
@@ -512,7 +654,7 @@ S.theme = type(S.theme) == "table" and S.theme or {}
 for k, v in pairs(TD) do if S.theme[k] == nil then S.theme[k] = cpv(v) end end
 local TH = S.theme
 local neonTrans, neonSeq
-local ok_blk3, err_blk3 = pcall(function()
+;(function() local ok, err = pcall(function()
 local RAINBOW_SEQ = ColorSequence.new({
     ColorSequenceKeypoint.new(0, Color3.fromHSV(0, 1, 1)), ColorSequenceKeypoint.new(1 / 6, Color3.fromHSV(1 / 6, 1, 1)),
     ColorSequenceKeypoint.new(2 / 6, Color3.fromHSV(2 / 6, 1, 1)), ColorSequenceKeypoint.new(3 / 6, Color3.fromHSV(3 / 6, 1, 1)),
@@ -529,7 +671,7 @@ function neonSeq()
     local b = hexToColor(TH.neonB) or a
     return ColorSequence.new(a, b)
 end
-end) if not ok_blk3 then warn("[blk3] " .. tostring(err_blk3)) end
+end) if not ok then warn("[blk3] " .. tostring(err)) end end)()
 -- Streamer mode state (names are random, beautiful and only change what is shown on YOUR screen)
 local Stream = { display = nil, handle = nil, active = false, hooked = setmetatable({}, { __mode = "k" }), conns = {}, watch = {}, humOrig = nil }
 local applyStreamer
@@ -574,7 +716,7 @@ local function makeSnow(parent, count, maxSize, watch)
     FX.snow[#FX.snow + 1] = obj
     return obj
 end
-local ok_blk4, err_blk4 = pcall(function()
+;(function() local ok, err = pcall(function()
     local skip, snowT = 0, 0
     bind(RunService.Heartbeat, function(dt)
         for i = #FX.neon, 1, -1 do
@@ -599,7 +741,7 @@ local ok_blk4, err_blk4 = pcall(function()
             end
         end
     end)
-end) if not ok_blk4 then warn("[blk4] " .. tostring(err_blk4)) end
+end) if not ok then warn("[blk4] " .. tostring(err)) end end)()
 
 local unlocked = false
 local KEY = { value = nil, expires = 0 }
@@ -616,11 +758,12 @@ local function fmtDur(sec)
 end
 local function keyLeftText()
     if not KEY.value then return "-" end
+    if KEY.expires == math.huge then return G("Unlimited", "Без ограничений") end
     return fmtDur(KEY.expires - nowT())
 end
 
 local makeKey, validateKey
-local ok_blk5, err_blk5 = pcall(function()
+;(function() local ok, err = pcall(function()
     local KC = CFG.Key
     local B32 = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     local function mul32(a, b)
@@ -682,13 +825,13 @@ local ok_blk5, err_blk5 = pcall(function()
         if t >= exp then return false, "expired" end
         return true, exp, fmt(s2), math.floor(nonce / 8388608)
     end
-end) if not ok_blk5 then warn("[blk5] " .. tostring(err_blk5)) end
+end) if not ok then warn("[blk5] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- Icons (vector, drawn from Frames - no external assets)
 ----------------------------------------------------------------------
 local icon
-local ok_blk6, err_blk6 = pcall(function()
+;(function() local ok, err = pcall(function()
 local ICONS = {
 home={{"l",36,132,128,48,20},{"l",128,48,220,132,20},{"l",66,116,66,212,20},{"l",66,212,190,212,20},{"l",190,212,190,116,20},{"l",112,212,112,156,20},{"l",112,156,144,156,20},{"l",144,156,144,212,20}},
 pencil={{"l",180,58,204,82,20},{"l",204,82,100,186,20},{"l",100,186,60,196,20},{"l",60,196,70,156,20},{"l",70,156,180,58,20},{"l",150,88,174,112,20}},
@@ -773,7 +916,7 @@ function icon(parent, name, px, color)
     drawIcon(box, ICONS[name] or ICONS.info, px / 256, color or C.text)
     return box
 end
-end) if not ok_blk6 then warn("[blk6] " .. tostring(err_blk6)) end
+end) if not ok then warn("[blk6] " .. tostring(err)) end end)()
 local function tint(o, c)
     for _, d in ipairs(o:GetDescendants()) do
         if d:IsA("UIStroke") then d.Color = c
@@ -790,7 +933,7 @@ end
 -- i18n
 ----------------------------------------------------------------------
 local I18N
-local ok_blk7, err_blk7 = pcall(function()
+;(function() local ok, err = pcall(function()
 local KEYS = { "Home", "Editor", "Scripts", "Console", "Settings", "Account", "Run", "Save", "Clear", "Search", "Language" }
 local function pack(t) local r = {} for i, k in ipairs(KEYS) do r[k] = t[i] end return r end
 I18N = {
@@ -802,7 +945,7 @@ I18N = {
     pl = pack({ "Start", "Edytor", "Skrypty", "Konsola", "Ustawienia", "Konto", "Uruchom", "Zapisz", "Wyczyść", "Szukaj", "Język" }),
     vi = pack({ "Trang chủ", "Trình soạn thảo", "Tập lệnh", "Bảng điều khiển", "Cài đặt", "Tài khoản", "Chạy", "Lưu", "Xóa", "Tìm kiếm", "Ngôn ngữ" }),
 }
-end) if not ok_blk7 then warn("[blk7] " .. tostring(err_blk7)) end
+end) if not ok then warn("[blk7] " .. tostring(err)) end end)()
 for k, v in pairs({
     Paste = "Вставить", Edit = "Правка", Saved = "Сохранённые", Favorites = "Избранное", Recent = "Недавние",
     All = "Все", Errors = "Ошибки", Warnings = "Предупреждения", Output = "Вывод", Filters = "Фильтры",
@@ -866,7 +1009,7 @@ local blur = new("BlurEffect", { Size = 0, Parent = game:GetService("Lighting") 
 -- BRANDING: custom name + logo (letter / emoji / image)
 ----------------------------------------------------------------------
 local BR = { logos = {}, defaultName = "SM1LER" }
-local ok_blk8, err_blk8 = pcall(function()
+;(function() local ok, err = pcall(function()
     DB.brand = type(DB.brand) == "table" and DB.brand or {}
     local function trim(t) return (string.gsub(tostring(t or ""), "^%s*(.-)%s*$", "%1")) end
     local function replaceWord(text, old, new)
@@ -972,7 +1115,7 @@ local ok_blk8, err_blk8 = pcall(function()
         BR.paint()
         return true
     end
-end) if not ok_blk8 then warn("[blk8] " .. tostring(err_blk8)) end
+end) if not ok then warn("[blk8] " .. tostring(err)) end end)()
 
 local function makeBrand(z)
     local B = {}
@@ -1204,8 +1347,10 @@ local bgI = new("ImageLabel", { Parent = content, Size = UDim2.fromScale(1, 1), 
     { round(14) })
 local bgD = new("Frame", { Parent = content, Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1, BorderSizePixel = 0 },
     { round(14) })
-local mainSnow = makeSnow(content, 24, 4, win)
+local mainSnow = makeSnow(content, 34, 5, win)
 mainSnow.holder.Visible = S.snow ~= false
+mainSnow.holder.ZIndex = 16   -- sit above page content (cards/buttons) like the New Year snow does, so it's actually visible
+for _, fl in ipairs(mainSnow.flakes) do fl.f.ZIndex = 16 end
 local lineT = new("Frame", { Parent = content, Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = C.line, BorderSizePixel = 0 })
 
 -- sidebar: transparent over the window (flat) or its own rounded card (split)
@@ -1379,7 +1524,7 @@ end
 
 -- title bar: logo, name, injector status, window buttons
 local TBAR = {}
-local ok_blk9, err_blk9 = pcall(function()
+;(function() local ok, err = pcall(function()
     local titleBar = new("Frame", { Parent = content, Size = UDim2.new(1, 0, 0, TH.titleH), BackgroundTransparency = 1, Visible = TH.titleBar })
     TBAR.frame = titleBar
     local tLogo = BR.addLogo(new("TextLabel", { Parent = titleBar, Position = UDim2.fromOffset(14, 8), Size = UDim2.fromOffset(22, 22), BackgroundColor3 = C.white, Text = "S", Font = Enum.Font.GothamBlack,
@@ -1396,11 +1541,11 @@ local ok_blk9, err_blk9 = pcall(function()
     TBAR.lbl = txt(TBAR.pill, G("Not injected", "Не подключён"), 12, C.text, Enum.Font.GothamMedium)
     TBAR.lbl.Position, TBAR.lbl.Size = UDim2.fromOffset(26, 0), UDim2.new(1, -30, 1, 0)
     placeTitle(TBAR.pill, 12)
-end) if not ok_blk9 then warn("[blk9] " .. tostring(err_blk9)) end
+end) if not ok then warn("[blk9] " .. tostring(err)) end end)()
 
 -- sidebar footer: who is signed in
 local SBU = {}
-local ok_blk10, err_blk10 = pcall(function()
+;(function() local ok, err = pcall(function()
     local card = new("Frame", { Parent = sidebar, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 8, 1, -10), Size = UDim2.new(1, -16, 0, 50), BackgroundColor3 = C.panel }, { round(10), stroke() })
     local av = new("ImageLabel", { Parent = card, Position = UDim2.fromOffset(8, 8), Size = UDim2.fromOffset(34, 34), BackgroundColor3 = C.item, Image = "", BorderSizePixel = 0 },
         { new("UICorner", { CornerRadius = UDim.new(0.5, 0) }) })
@@ -1413,18 +1558,22 @@ local ok_blk10, err_blk10 = pcall(function()
         local ok, url = pcall(function() return Players:GetUserThumbnailAsync(LP.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48) end)
         if ok and url and av.Parent then av.Image = url end
     end)
-end) if not ok_blk10 then warn("[blk10] " .. tostring(err_blk10)) end
+end) if not ok then warn("[blk10] " .. tostring(err)) end end)()
 
 -- watermark (name + version, bottom-right of the window)
 local WMK = new("TextLabel", { Parent = win, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -10, 1, -6), Size = UDim2.fromOffset(200, 16),
     BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 11, TextColor3 = Color3.new(1, 1, 1), TextTransparency = 0.5,
     TextXAlignment = Enum.TextXAlignment.Right, Text = "", ZIndex = 50, Visible = false })
 task.spawn(function()
+        local ok_spawn1, err_spawn1 = pcall(function()
     while alive do
         WMK.Text = CFG.Name .. " · v" .. CFG.Version
         task.wait(1)
     end
-end)
+
+        end)
+        if not ok_spawn1 then warn("[spawn1] " .. tostring(err_spawn1)) end
+    end)
 
 -- faint grid overlay inside the content area (decorative)
 local GRID = new("Frame", { Parent = content, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ClipsDescendants = true, Visible = false, ZIndex = 1, BorderSizePixel = 0 })
@@ -1443,7 +1592,7 @@ LY.hooks[#LY.hooks + 1] = buildGrid
 
 -- panel depth: adds a soft 1px shadow line under every C.panel-colored surface
 local PDEPTH = {}
-local ok_blk11, err_blk11 = pcall(function()
+;(function() local ok, err = pcall(function()
     local tagged, lastDepth = {}, -1
     function PDEPTH.apply(depth)
         if depth == lastDepth then return end
@@ -1463,10 +1612,10 @@ local ok_blk11, err_blk11 = pcall(function()
             end
         end
     end
-end) if not ok_blk11 then warn("[blk11] " .. tostring(err_blk11)) end
+end) if not ok then warn("[blk11] " .. tostring(err)) end end)()
 
 -- collapse / expand button (vertical sidebar)
-local ok_blk12, err_blk12 = pcall(function()
+;(function() local ok, err = pcall(function()
     local cb = new("TextButton", { Parent = sidebar, AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 8, 1, -68), Size = UDim2.new(1, -16, 0, 30),
         BackgroundColor3 = C.item, BackgroundTransparency = 1, AutoButtonColor = false, Text = "" }, { round(8) })
     local cic = icon(cb, "left", 14, C.sub)
@@ -1482,7 +1631,7 @@ local ok_blk12, err_blk12 = pcall(function()
     end)
     bind(cb.MouseEnter, function() tween(cb, 0.1, { BackgroundTransparency = 0.6 }) end)
     bind(cb.MouseLeave, function() tween(cb, 0.1, { BackgroundTransparency = 1 }) end)
-end) if not ok_blk12 then warn("[blk12] " .. tostring(err_blk12)) end
+end) if not ok then warn("[blk12] " .. tostring(err)) end end)()
 
 -- the layout engine: reads the theme and places every region
 function LY.apply(animate)
@@ -1525,7 +1674,9 @@ function LY.apply(animate)
     for _, e in ipairs(names) do
         local name = e[1]
         local o = navBtns[name]
-        local hidden = type(c.navOff) == "table" and c.navOff[name] == true and name ~= "Settings" and name ~= "Theme"
+        local hidden = (type(c.navOff) == "table" and c.navOff[name] == true and name ~= "Settings" and name ~= "Theme")
+            or (name == "AI" and not S.aiEnabled)
+            or (name == "Panel" and not isOwner())
         o.b.Visible = not hidden
         if not hidden then
             if vertical then
@@ -1606,7 +1757,7 @@ local runSource, openInEditor
 -- HOME
 ----------------------------------------------------------------------
 local refreshHome
-local ok_blk13, err_blk13 = pcall(function()
+;(function() local ok, err = pcall(function()
     local homePage = addPage("Home", "home")
     local homeScroll = new("ScrollingFrame", { Parent = homePage, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
         ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y })
@@ -1712,9 +1863,9 @@ local ok_blk13, err_blk13 = pcall(function()
         SBU.sub.Text = PLAN[DB.planTier] or G("Signed in", "Вошёл")
         sub.Text = T("Welcome back") .. ", " .. dispName()
         aV.Text = "@" .. userName()
-        pV.Text = PLAN[DB.planTier] or G("Standard", "Стандарт")
+        pV.Text = (DB.planTier == "owner") and "👑 OWNER" or (PLAN[DB.planTier] or G("Standard", "Стандарт"))
         lV.Text = KEY.value and G("Active key", "Активный ключ") or G("No key", "Нет ключа")
-        lS.Text = KEY.value and (G("Valid until ", "Действует до ") .. os.date("%b %d, %H:%M", KEY.expires)) or ""
+        lS.Text = (not KEY.value) and "" or (KEY.expires == math.huge and G("Owner access", "Доступ владельца") or (G("Valid until ", "Действует до ") .. os.date("%b %d, %H:%M", KEY.expires)))
         tV.Text = keyLeftText()
         local dotColor = { ok = C.ok, updating = C.warn, down = C.err }
         stDot1.BackgroundColor3 = dotColor[STAT.status] or C.ok
@@ -1738,13 +1889,13 @@ local ok_blk13, err_blk13 = pcall(function()
             task.wait(1)
         end
     end)
-end) if not ok_blk13 then warn("[blk13] " .. tostring(err_blk13)) end
+end) if not ok then warn("[blk13] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- Lua syntax highlighter
 ----------------------------------------------------------------------
 local esc, highlight, setSyntax, resetSyntax, getSyntax
-local ok_blk14, err_blk14 = pcall(function()
+;(function() local ok, err = pcall(function()
 local KW, BI = {}, {}
 for w in string.gmatch("and break do else elseif end false for function if in local nil not or repeat return then true until while continue", "%a+") do KW[w] = true end
 for w in string.gmatch("print warn error game workspace script task wait spawn delay pairs ipairs next type typeof tostring tonumber require pcall xpcall loadstring getfenv setmetatable getmetatable Instance Vector2 Vector3 CFrame Color3 UDim2 Enum string table math os", "%a+") do BI[w] = true end
@@ -1808,7 +1959,7 @@ function highlight(src)
     return table.concat(out)
 end
 
-end) if not ok_blk14 then warn("[blk14] " .. tostring(err_blk14)) end
+end) if not ok then warn("[blk14] " .. tostring(err)) end end)()
 if type(DB.activeSyn) == "table" then setSyntax(DB.activeSyn) end
 
 ----------------------------------------------------------------------
@@ -1902,8 +2053,12 @@ local function pulseInject()
     for _, P in ipairs(INJ.ui) do
         if P.b.Parent and P.b.Visible then
             task.spawn(function()
+        local ok_spawn2, err_spawn2 = pcall(function()
                 for _, r in ipairs({ 5, -5, 4, -4, 0 }) do P.b.Rotation = r task.wait(0.04) end
-            end)
+            
+        end)
+        if not ok_spawn2 then warn("[spawn2] " .. tostring(err_spawn2)) end
+    end)
         end
     end
 end
@@ -2082,7 +2237,7 @@ local function loadTab()
     rebuildTabs()
 end
 
-local ok_blk15, err_blk15 = pcall(function()
+;(function() local ok, err = pcall(function()
     local editorPage = addPage("Editor", "pencil")
     newTab('-- ' .. string.lower(CFG.Name) .. '\nprint("hello from ' .. CFG.Name .. '")')
     local h = new("Frame", { Parent = editorPage, Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1 })
@@ -2130,11 +2285,15 @@ local ok_blk15, err_blk15 = pcall(function()
     local injB = makeInjectButton(crumbRow, UDim2.fromOffset(108, 26))
     injB.b.AnchorPoint, injB.b.Position = Vector2.new(1, 0.5), UDim2.new(1, 0, 0.5, 0)
     task.spawn(function()
+        local ok_spawn3, err_spawn3 = pcall(function()
         while alive do
             local tb = tabs[activeTab]
             crumb.Text = tb and tb.name or ""
             task.wait(0.3)
         end
+    
+        end)
+        if not ok_spawn3 then warn("[spawn3] " .. tostring(err_spawn3)) end
     end)
     local statusLbl = new("TextLabel", { Parent = editorPage, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -6, 1, -46), Size = UDim2.fromOffset(320, 16),
         BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.sub, TextXAlignment = Enum.TextXAlignment.Right,
@@ -2400,6 +2559,7 @@ local ok_blk15, err_blk15 = pcall(function()
     bind(srch:GetPropertyChangedSignal("Text"), treeRender)
     treeRender()
     task.spawn(function()
+        local ok_spawn4, err_spawn4 = pcall(function()
         while alive do
             task.wait(1.5)
             if currentPage == "Editor" and tree.Visible then
@@ -2409,6 +2569,9 @@ local ok_blk15, err_blk15 = pcall(function()
                 if sig ~= lastSig then lastSig = sig treeRender() end
             end
         end
+    
+        end)
+        if not ok_spawn4 then warn("[spawn4] " .. tostring(err_spawn4)) end
     end)
     local edLayout
     local listBtn = ab("list", 0, function()
@@ -2516,7 +2679,7 @@ local ok_blk15, err_blk15 = pcall(function()
         end
     end
     loadTab()
-end) if not ok_blk15 then warn("[blk15] " .. tostring(err_blk15)) end
+end) if not ok then warn("[blk15] " .. tostring(err)) end end)()
 function openInEditor(name, src)
     newTab(src, name)
     loadTab()
@@ -2527,14 +2690,14 @@ end
 -- RUN
 ----------------------------------------------------------------------
 local saveSoon
-local ok_blk16, err_blk16 = pcall(function()
+;(function() local ok, err = pcall(function()
     local tok = 0
     saveSoon = function()
         tok = tok + 1
         local my = tok
         task.delay(1.5, function() if my == tok then saveDB() end end)
     end
-end) if not ok_blk16 then warn("[blk16] " .. tostring(err_blk16)) end
+end) if not ok then warn("[blk16] " .. tostring(err)) end end)()
 local function touchRecent(name)
     for i = #DB.recent, 1, -1 do if DB.recent[i] == name then table.remove(DB.recent, i) end end
     table.insert(DB.recent, 1, name)
@@ -2611,7 +2774,7 @@ end
 ----------------------------------------------------------------------
 -- SCRIPTS (Local / Hub / URL)
 ----------------------------------------------------------------------
-local ok_blk17, err_blk17 = pcall(function()
+;(function() local ok, err = pcall(function()
     local scriptsPage = addPage("Scripts", "code")
     local h = header(scriptsPage, "Scripts")
     local mode = "Local"
@@ -2956,9 +3119,13 @@ local ok_blk17, err_blk17 = pcall(function()
             local url = string.gsub(box.Text, "^%s*(.-)%s*$", "%1")
             if not string.match(url, "^https?://") then notify("Enter a valid http(s) URL") return end
             task.spawn(function()
+        local ok_spawn5, err_spawn5 = pcall(function()
                 local body, err = http(url)
                 if body then cb(url, body) else notify("Request failed") addLog("WARN", "URL request failed: " .. tostring(err)) end
-            end)
+            
+        end)
+        if not ok_spawn5 then warn("[spawn5] " .. tostring(err_spawn5)) end
+    end)
         end
         pill(p, "Run", "play", UDim2.fromOffset(100, 36), nil, true).b.Parent = acts
         pill(acts, "Edit", "pencil", UDim2.fromOffset(100, 36), nil)
@@ -2982,12 +3149,12 @@ local ok_blk17, err_blk17 = pcall(function()
     end
 
     setMode("Local")
-end) if not ok_blk17 then warn("[blk17] " .. tostring(err_blk17)) end
+end) if not ok then warn("[blk17] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- CONSOLE
 ----------------------------------------------------------------------
-local ok_blk18, err_blk18 = pcall(function()
+;(function() local ok, err = pcall(function()
     local consolePage = addPage("Console", "terminal")
     local h = header(consolePage, "Console")
     local follow, filter = true, "All"
@@ -3068,6 +3235,7 @@ local ok_blk18, err_blk18 = pcall(function()
         if matches(e) then pending[#pending + 1] = e end
     end
     task.spawn(function()
+        local ok_spawn6, err_spawn6 = pcall(function()
         while alive do
             task.wait(0.12)
             if #pending > 0 then
@@ -3082,6 +3250,9 @@ local ok_blk18, err_blk18 = pcall(function()
                 if follow then task.defer(function() list.CanvasPosition = Vector2.new(0, math.max(0, list.AbsoluteCanvasSize.Y)) end) end
             end
         end
+    
+        end)
+        if not ok_spawn6 then warn("[spawn6] " .. tostring(err_spawn6)) end
     end)
     local followP = pill(ctl, "Follow on", "terminal", UDim2.fromOffset(122, 32), nil)
     followP.b.LayoutOrder = 1
@@ -3157,7 +3328,7 @@ local ok_blk18, err_blk18 = pcall(function()
     bn.b.LayoutOrder = 11
     updateBanCount()
     rebuild()
-end) if not ok_blk18 then warn("[blk18] " .. tostring(err_blk18)) end
+end) if not ok then warn("[blk18] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- AI: a small chat tab backed by the person's own free API key (Gemini or Groq).
@@ -3314,6 +3485,225 @@ local ok_AIpage, err_AIpage = pcall(function()
 end)
 if not ok_AIpage then warn("[AI page] " .. tostring(err_AIpage)) end
 
+----------------------------------------------------------------------
+-- PANEL (owner only): status editor, Discord announcement composer, GitHub publish
+----------------------------------------------------------------------
+;(function() local ok, err = pcall(function()
+    local pg = addPage("Panel", "star")
+    local h, title = header(pg, "Panel")
+    local sub = txt(h, G("Owner tools · not shown to other players", "Инструменты владельца · другим игрокам не видны"), 12, C.sub)
+    sub.Position, sub.Size = UDim2.fromOffset(0, 24), UDim2.new(1, 0, 0, 16)
+
+    DB.panel = type(DB.panel) == "table" and DB.panel or {}
+    local PL = DB.panel
+    for k, v in pairs({ webhookUrl = "", ghOwner = "", ghRepo = "", ghBranch = "main", ghPath = "version.json", ghToken = "",
+        title = "", tagline = "", signature = "", bullets = "", link = "", linkLabel = "", everyone = false, roleId = "", autoPublish = false, lastAnnounced = "" }) do
+        if PL[k] == nil then PL[k] = v end
+    end
+
+    local scroll = new("ScrollingFrame", { Parent = pg, Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -44), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new() }, { vlist(10) })
+    local oc = 0
+    local function section(label)
+        oc = oc + 1
+        local l = txt(scroll, label, 13, C.sub, Enum.Font.GothamBold)
+        l.LayoutOrder, l.Size = oc, UDim2.new(1, -6, 0, 20)
+    end
+    local function field(label, key, placeholder, w, multiline)
+        oc = oc + 1
+        local row = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, multiline and 90 or 36), BackgroundTransparency = 1 })
+        local l = txt(row, label, 12, C.sub)
+        l.Size = UDim2.fromOffset(w or 120, multiline and 20 or 36)
+        local tb = new("TextBox", { Parent = row, Position = UDim2.fromOffset(w or 120, multiline and 20 or 3), Size = UDim2.new(1, -(w or 120), 0, multiline and 66 or 30),
+            BackgroundColor3 = C.item, TextColor3 = C.text, PlaceholderColor3 = C.sub, PlaceholderText = placeholder or "", Font = Enum.Font.Gotham, TextSize = 13,
+            Text = PL[key], ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+            MultiLine = multiline, TextWrapped = multiline, ClipsDescendants = true }, { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingTop = UDim.new(0, multiline and 6 or 0) }) })
+        bind(tb.FocusLost, function() PL[key] = tb.Text saveDB() end)
+        return tb
+    end
+    local function tgl(label, key, onChange)
+        oc = oc + 1
+        local row = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, 34), BackgroundTransparency = 1 })
+        local l = txt(row, label, 13, C.text, Enum.Font.GothamMedium)
+        l.Size = UDim2.new(1, -60, 1, 0)
+        local track = new("TextButton", { Parent = row, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -4, 0.5, 0), Size = UDim2.fromOffset(46, 26),
+            AutoButtonColor = false, Text = "", BackgroundColor3 = PL[key] and C.white or C.item }, { round(13) })
+        local knob = new("Frame", { Parent = track, AnchorPoint = Vector2.new(0, 0.5), Position = PL[key] and UDim2.new(1, -23, 0.5, 0) or UDim2.new(0, 3, 0.5, 0),
+            Size = UDim2.fromOffset(20, 20), BackgroundColor3 = PL[key] and C.black or C.sub, BorderSizePixel = 0 }, { round(10) })
+        bind(track.MouseButton1Click, function()
+            PL[key] = not PL[key]
+            saveDB()
+            track.BackgroundColor3 = PL[key] and C.white or C.item
+            tween(knob, 0.12, { Position = PL[key] and UDim2.new(1, -23, 0.5, 0) or UDim2.new(0, 3, 0.5, 0), BackgroundColor3 = PL[key] and C.black or C.sub })
+            if onChange then onChange(PL[key]) end
+        end)
+    end
+    local function btnRow(buttons)
+        oc = oc + 1
+        local row = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, 36), BackgroundTransparency = 1 }, { hlist(8) })
+        for i, b in ipairs(buttons) do
+            local p = pill(row, b[1], b[2], UDim2.fromOffset(b[4] or 170, 34), b[3], b.primary)
+            p.b.LayoutOrder = i
+        end
+    end
+    local function msg(text, color)
+        oc = oc + 1
+        local l = txt(scroll, text, 12, color or C.sub)
+        l.LayoutOrder, l.Size, l.TextWrapped = oc, UDim2.new(1, -6, 0, 30), true
+        return l
+    end
+
+    -- status editor ---------------------------------------------------
+    section(G("Status (shown on Home + sent to Discord)", "Статус (показан на Home + уходит в Discord)"))
+    oc = oc + 1
+    local stRow = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, 34), BackgroundTransparency = 1 }, { hlist(8) })
+    local stBtns = {}
+    for i, k in ipairs({ "ok", "updating", "down" }) do
+        local b = new("TextButton", { Parent = stRow, LayoutOrder = i, Size = UDim2.fromOffset(130, 34), BackgroundColor3 = C.item, AutoButtonColor = false, Text = "" }, { round(9) })
+        local t = txt(b, CFG.Status.Icons[k] .. " " .. STAT.label(k), 13, C.text, Enum.Font.GothamMedium, Enum.TextXAlignment.Center)
+        t.Size = UDim2.fromScale(1, 1)
+        stBtns[k] = b
+        b.MouseButton1Click:Connect(function() STAT.status = k saveDB() for kk, bb in pairs(stBtns) do bb.BackgroundColor3 = (kk == STAT.status) and C.white or C.item end end)
+    end
+    for k, b in pairs(stBtns) do b.BackgroundColor3 = (k == STAT.status) and C.white or C.item end
+    oc = oc + 1
+    local dtRow = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, 34), BackgroundTransparency = 1 }, { hlist(8) })
+    local dtBtns = {}
+    for i, k in ipairs({ "ok", "updating", "down" }) do
+        local b = new("TextButton", { Parent = dtRow, LayoutOrder = i, Size = UDim2.fromOffset(130, 34), BackgroundColor3 = C.item, AutoButtonColor = false, Text = "" }, { round(9) })
+        local t = txt(b, CFG.Status.Icons[k] .. " " .. G("Detect: ", "Детект: ") .. STAT.label(k), 13, C.text, Enum.Font.GothamMedium, Enum.TextXAlignment.Center)
+        t.Size = UDim2.fromScale(1, 1)
+        dtBtns[k] = b
+        b.MouseButton1Click:Connect(function() STAT.detect = k saveDB() for kk, bb in pairs(dtBtns) do bb.BackgroundColor3 = (kk == STAT.detect) and C.white or C.item end end)
+    end
+    for k, b in pairs(dtBtns) do b.BackgroundColor3 = (k == STAT.detect) and C.white or C.item end
+    msg(G("These two change immediately here and in every Discord post. Push them to GitHub below so everyone else's game picks them up too.",
+        "Эти два применяются сразу здесь и во всех постах в Discord. Чтобы они дошли до остальных игроков, нажми ниже «Запушить в GitHub»."))
+
+    -- announcement composer -------------------------------------------
+    section(G("Announcement", "Анонс обновления"))
+    field(G("Title", "Заголовок"), "title", CFG.Name .. " " .. CFG.Version .. "-beta")
+    field(G("Tagline (quoted)", "Подпись (в кавычках)"), "tagline", G("I'm here", "Я тут"))
+    field(G("Signature", "Подпись внизу"), "signature", "— " .. CFG.Name)
+    local bulletsTb = field(G("Changes (one per line)", "Изменения (по одному на строку)"), "bullets", G("Update to latest.\nFixed...\nAdded...", "Обновись до последней версии.\nИсправлено...\nДобавлено..."), 120, true)
+    field(G("Link label", "Текст ссылки"), "linkLabel", "Download")
+    field(G("Link URL", "Ссылка"), "link", "https://...")
+    tgl(G("Mention @everyone", "Упомянуть @everyone"), "everyone")
+    field(G("Mention role ID (optional)", "ID роли (необязательно)"), "roleId", "1483491294847439058")
+
+    oc = oc + 1
+    local previewBox = new("Frame", { Parent = scroll, LayoutOrder = oc, Size = UDim2.new(1, -6, 0, 150), BackgroundColor3 = Color3.fromRGB(10, 10, 12) }, { round(10), stroke() })
+    local previewLbl = txt(previewBox, "", 12, Color3.fromRGB(220, 220, 225), Enum.Font.Code)
+    previewLbl.Position, previewLbl.Size, previewLbl.TextWrapped = UDim2.fromOffset(10, 8), UDim2.new(1, -20, 1, -16), true
+    previewLbl.TextYAlignment = Enum.TextYAlignment.Top
+
+    local function bullets()
+        local out = {}
+        for line in (PL.bullets .. "\n"):gmatch("(.-)\n") do
+            line = (line:gsub("^%s+", ""):gsub("%s+$", ""))
+            if line ~= "" then out[#out + 1] = line end
+        end
+        return out
+    end
+    local function buildAnnounce()
+        return { title = PL.title ~= "" and PL.title or (CFG.Name .. " " .. CFG.Version), tagline = PL.tagline, signature = PL.signature,
+            bullets = bullets(), link = PL.link, linkLabel = PL.linkLabel, everyone = PL.everyone, roleId = PL.roleId }
+    end
+    local function refreshPreview()
+        local ok, _, content = pcall(function() return DISC.announce end)
+        local a = buildAnnounce()
+        local lines = {}
+        local mention = ""
+        if a.everyone then mention = mention .. "@everyone " end
+        if a.roleId ~= "" then mention = mention .. "<@&" .. a.roleId .. "> " end
+        lines[#lines + 1] = a.title .. (mention ~= "" and (" " .. mention) or "")
+        if a.tagline ~= "" then lines[#lines + 1] = "\"" .. a.tagline .. "\"" end
+        if a.signature ~= "" then lines[#lines + 1] = a.signature end
+        lines[#lines + 1] = ""
+        for _, b in ipairs(a.bullets) do lines[#lines + 1] = "- " .. b end
+        if a.link ~= "" then lines[#lines + 1] = (a.linkLabel ~= "" and a.linkLabel or "Download") .. ": " .. a.link end
+        previewLbl.Text = table.concat(lines, "\n")
+    end
+    refreshPreview()
+    for _, tb in ipairs(scroll:GetDescendants()) do
+        if tb:IsA("TextBox") then bind(tb:GetPropertyChangedSignal("Text"), function() task.defer(refreshPreview) end) end
+    end
+
+    local sendMsg = msg("")
+    btnRow({
+        { G("Send to Discord", "Отправить в Discord"), "bolt", function()
+            local ok, content = DISC.announce(buildAnnounce())
+            sendMsg.Text = ok and G("Sent ✓", "Отправлено ✓") or (G("Failed: ", "Ошибка: ") .. tostring(content))
+            sendMsg.TextColor3 = ok and C.ok or C.err
+            if ok then PL.lastAnnounced = CFG.Version saveDB() end
+        end, w = 190, primary = true },
+        { G("Copy text", "Копировать текст"), "copy", function()
+            if setclipboard then pcall(setclipboard, previewLbl.Text) notify(G("Copied", "Скопировано")) end
+        end, w = 160 },
+    })
+    tgl(G("Auto-send once per new version (owner only, fires once)", "Авто-отправка раз на версию (только владелец, один раз)"), "autoPublish")
+
+    -- GitHub publish -----------------------------------------------
+    section(G("GitHub (pushes version.json)", "GitHub (обновляет version.json)"))
+    field("GitHub owner", "ghOwner", "wave92522-commits")
+    field(G("Repository", "Репозиторий"), "ghRepo", "version.json")
+    field(G("Branch", "Ветка"), "ghBranch", "main")
+    field(G("File path", "Путь к файлу"), "ghPath", "version.json")
+    field(G("Personal access token", "Личный токен доступа"), "ghToken", "ghp_...")
+    msg(G("Create a free classic token at github.com/settings/tokens with the \"repo\" scope checked. Saved only on this device.",
+        "Создай бесплатный classic-токен на github.com/settings/tokens с галочкой \"repo\". Хранится только у тебя."))
+    local ghMsg = msg("")
+    btnRow({
+        { G("Push status + changelog", "Запушить статус + чейнджлог"), "server", function()
+            ghMsg.Text, ghMsg.TextColor3 = G("Pushing...", "Публикую..."), C.sub
+            task.spawn(function()
+                local ok, err = GH.publishStatus(bullets())
+                ghMsg.Text = ok and G("Pushed ✓", "Готово ✓") or (G("Failed: ", "Ошибка: ") .. tostring(err))
+                ghMsg.TextColor3 = ok and C.ok or C.err
+            end)
+        end, w = 220, primary = true },
+    })
+
+    -- misc utilities -----------------------------------------------
+    section(G("Utilities", "Прочее"))
+    local utilMsg = msg("")
+    btnRow({
+        { G("Send test webhook", "Тест вебхука"), "bolt", function() DISC.post("test") notify(G("Sent", "Отправлено")) end, w = 170 },
+        { G("Force check updates", "Проверить обновления"), "refresh", function()
+            task.spawn(function()
+                local m = UPD.remote()
+                utilMsg.Text = m and (G("Remote version: ", "Версия на сервере: ") .. m.version) or G("Could not reach the manifest", "Не удалось получить манифест")
+            end)
+        end, w = 190 },
+        { G("Copy debug info", "Копировать debug-инфо"), "copy", function()
+            local ex = "unknown"
+            pcall(function() local ok, n = pcall(identifyexecutor) if ok then ex = tostring(n) end end)
+            local info = string.format("%s v%s\nExecutor: %s\nGame: %s (place %s)\nPlayers: %d\nStatus: %s / %s",
+                CFG.Name, CFG.Version, ex, tostring(game.Name or game.GameId), tostring(game.PlaceId), #Players:GetPlayers(), STAT.status, STAT.detect)
+            if setclipboard then pcall(setclipboard, info) notify(G("Copied", "Скопировано")) end
+        end, w = 200 },
+    })
+end)
+if not ok then warn("[Panel page] " .. tostring(err)) end end)()
+
+-- one-time auto-announce: if the owner enabled it and this version hasn't been sent yet
+task.spawn(function()
+    local ok_autoAnn, err_autoAnn = pcall(function()
+        task.wait(2)
+        if isOwner() and type(DB.panel) == "table" and DB.panel.autoPublish and DB.panel.lastAnnounced ~= CFG.Version and DISC.enabled() then
+            local bl = {}
+            for line in (tostring(DB.panel.bullets or "") .. "\n"):gmatch("(.-)\n") do
+                line = (line:gsub("^%s+", ""):gsub("%s+$", ""))
+                if line ~= "" then bl[#bl + 1] = line end
+            end
+            local ok = DISC.announce({ title = (DB.panel.title ~= "" and DB.panel.title) or (CFG.Name .. " " .. CFG.Version), tagline = DB.panel.tagline,
+                signature = DB.panel.signature, bullets = bl, link = DB.panel.link, linkLabel = DB.panel.linkLabel, everyone = DB.panel.everyone, roleId = DB.panel.roleId })
+            if ok then DB.panel.lastAnnounced = CFG.Version saveDB() end
+        end
+    end)
+    if not ok_autoAnn then warn("[auto-announce] " .. tostring(err_autoAnn)) end
+end)
+
 
 ----------------------------------------------------------------------
 ----------------------------------------------------------------------
@@ -3321,7 +3711,7 @@ if not ok_AIpage then warn("[AI page] " .. tostring(err_AIpage)) end
 ----------------------------------------------------------------------
 local startTour
 local CT = {}   -- custom themes manager (functions are defined next to the Theme page)
-local ok_blk19, err_blk19 = pcall(function()
+;(function() local ok, err = pcall(function()
     local settingsPage = addPage("Settings", "gear")
     local h = header(settingsPage, "Settings")
     local qt = pill(h, "Quick tour", "book", UDim2.fromOffset(128, 32), function() startTour() end)
@@ -3792,62 +4182,68 @@ local ok_blk19, err_blk19 = pcall(function()
 
     -- branding
     do
-    -- Backdoor Mode + Discord status webhook
-    do
-    -- AI tab: your own key, saved locally, never bundled with the script
-    do
         section(G("AI", "ИИ"))
-        DB.ai = type(DB.ai) == "table" and DB.ai or { key = "", provider = "gemini", model = "" }
-        local prow = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 34), BackgroundTransparency = 1 }, { hlist(8) })
-        oc = oc + 1
-        local provBtns = {}
-        local function paintProv()
-            for k, b in pairs(provBtns) do
-                local on = DB.ai.provider == k
-                b.BackgroundColor3 = on and C.white or C.item
-                b:FindFirstChildOfClass("TextLabel").TextColor3 = on and C.black or C.text
-            end
-        end
-        for i, d in ipairs({ { "gemini", "Gemini (Google AI Studio)" }, { "groq", "Groq" } }) do
-            local b = new("TextButton", { Parent = prow, LayoutOrder = i, Size = UDim2.fromOffset(190, 34), BackgroundColor3 = C.item, AutoButtonColor = false, Text = "" }, { round(9) })
-            local t = txt(b, d[2], 13, C.text, Enum.Font.GothamMedium, Enum.TextXAlignment.Center)
-            t.Size = UDim2.fromScale(1, 1)
-            provBtns[d[1]] = b
-            b.MouseButton1Click:Connect(function() DB.ai.provider = d[1] saveDB() paintProv() end)
-        end
-        paintProv()
-
-        local kr = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 36), BackgroundTransparency = 1 })
-        oc = oc + 1
-        local kl = txt(kr, G("API key", "API-ключ"), 12, C.sub)
-        kl.Size = UDim2.fromOffset(64, 36)
-        local keyTb = new("TextBox", { Parent = kr, Position = UDim2.fromOffset(68, 3), Size = UDim2.new(1, -68, 0, 30), BackgroundColor3 = C.item, TextColor3 = C.text,
-            PlaceholderColor3 = C.sub, PlaceholderText = "AIzaSy... / gsk_...", Font = Enum.Font.Code, TextSize = 13, Text = DB.ai.key, ClearTextOnFocus = false,
-            TextXAlignment = Enum.TextXAlignment.Left }, { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
-        bind(keyTb.FocusLost, function() DB.ai.key = keyTb.Text saveDB() end)
-
-        local mr = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 36), BackgroundTransparency = 1 })
-        oc = oc + 1
-        local ml = txt(mr, G("Model", "Модель"), 12, C.sub)
-        ml.Size = UDim2.fromOffset(64, 36)
-        local modelTb = new("TextBox", { Parent = mr, Position = UDim2.fromOffset(68, 3), Size = UDim2.new(1, -68, 0, 30), BackgroundColor3 = C.item, TextColor3 = C.text,
-            PlaceholderColor3 = C.sub, PlaceholderText = G("leave empty for the default", "пусто = модель по умолчанию"), Font = Enum.Font.Code, TextSize = 13, Text = DB.ai.model,
-            ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left }, { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
-        bind(modelTb.FocusLost, function() DB.ai.model = modelTb.Text saveDB() end)
-
-        local aiHint = txt(scroll, G("Get a free key at aistudio.google.com (Gemini) or console.groq.com (Groq). Saved only on this device, sent only to that provider.",
-            "Бесплатный ключ: aistudio.google.com (Gemini) или console.groq.com (Groq). Хранится только у тебя, уходит только этому провайдеру."), 11, C.sub)
-        oc = oc + 1
-        aiHint.LayoutOrder, aiHint.Size, aiHint.TextWrapped = oc, UDim2.new(1, -6, 0, 42), true
-        oc = oc + 1
-        local testB = pill(scroll, G("Test key", "Проверить ключ"), "bolt", UDim2.fromOffset(170, 32), function()
-            notify(G("Testing...", "Проверяю..."))
-            AI.ask({ { role = "user", text = "Say OK in one word." } }, function(ok, res)
-                notify(ok and (G("Works: ", "Работает: ") .. tostring(res)) or (G("Failed: ", "Ошибка: ") .. tostring(res)))
+        do
+            local bg = grid()
+            toggle(cell(bg, G("Enable AI tab", "Включить вкладку ИИ")), "aiEnabled", function(v)
+                if navBtns.AI then navBtns.AI.b.Visible = v end
+                if LY and LY.apply then pcall(LY.apply, false) end
+                notify(v and G("AI tab enabled - reopen Settings to see the key field", "Вкладка ИИ включена - переоткрой Settings, чтобы увидеть поле ключа")
+                    or G("AI tab disabled", "Вкладка ИИ выключена"))
             end)
-        end)
-        testB.b.LayoutOrder = oc
-    end
+        end
+        DB.ai = type(DB.ai) == "table" and DB.ai or { key = "", provider = "gemini", model = "" }
+        if S.aiEnabled then
+            local prow = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 34), BackgroundTransparency = 1 }, { hlist(8) })
+            oc = oc + 1
+            local provBtns = {}
+            local function paintProv()
+                for k, b in pairs(provBtns) do
+                    local on = DB.ai.provider == k
+                    b.BackgroundColor3 = on and C.white or C.item
+                    b:FindFirstChildOfClass("TextLabel").TextColor3 = on and C.black or C.text
+                end
+            end
+            for i, d in ipairs({ { "gemini", "Gemini (Google AI Studio)" }, { "groq", "Groq" } }) do
+                local b = new("TextButton", { Parent = prow, LayoutOrder = i, Size = UDim2.fromOffset(190, 34), BackgroundColor3 = C.item, AutoButtonColor = false, Text = "" }, { round(9) })
+                local t = txt(b, d[2], 13, C.text, Enum.Font.GothamMedium, Enum.TextXAlignment.Center)
+                t.Size = UDim2.fromScale(1, 1)
+                provBtns[d[1]] = b
+                b.MouseButton1Click:Connect(function() DB.ai.provider = d[1] saveDB() paintProv() end)
+            end
+            paintProv()
+
+            local kr = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 36), BackgroundTransparency = 1 })
+            oc = oc + 1
+            local kl = txt(kr, G("API key", "API-ключ"), 12, C.sub)
+            kl.Size = UDim2.fromOffset(64, 36)
+            local keyTb = new("TextBox", { Parent = kr, Position = UDim2.fromOffset(68, 3), Size = UDim2.new(1, -68, 0, 30), BackgroundColor3 = C.item, TextColor3 = C.text,
+                PlaceholderColor3 = C.sub, PlaceholderText = "AIzaSy... / gsk_...", Font = Enum.Font.Code, TextSize = 13, Text = DB.ai.key, ClearTextOnFocus = false,
+                TextXAlignment = Enum.TextXAlignment.Left }, { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+            bind(keyTb.FocusLost, function() DB.ai.key = keyTb.Text saveDB() end)
+
+            local mr = new("Frame", { Parent = scroll, LayoutOrder = (oc + 1), Size = UDim2.new(1, -6, 0, 36), BackgroundTransparency = 1 })
+            oc = oc + 1
+            local ml = txt(mr, G("Model", "Модель"), 12, C.sub)
+            ml.Size = UDim2.fromOffset(64, 36)
+            local modelTb = new("TextBox", { Parent = mr, Position = UDim2.fromOffset(68, 3), Size = UDim2.new(1, -68, 0, 30), BackgroundColor3 = C.item, TextColor3 = C.text,
+                PlaceholderColor3 = C.sub, PlaceholderText = G("leave empty for the default", "пусто = модель по умолчанию"), Font = Enum.Font.Code, TextSize = 13, Text = DB.ai.model,
+                ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left }, { round(9), new("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+            bind(modelTb.FocusLost, function() DB.ai.model = modelTb.Text saveDB() end)
+
+            local aiHint = txt(scroll, G("Get a free key at aistudio.google.com (Gemini) or console.groq.com (Groq). Saved only on this device, sent only to that provider.",
+                "Бесплатный ключ: aistudio.google.com (Gemini) или console.groq.com (Groq). Хранится только у тебя, уходит только этому провайдеру."), 11, C.sub)
+            oc = oc + 1
+            aiHint.LayoutOrder, aiHint.Size, aiHint.TextWrapped = oc, UDim2.new(1, -6, 0, 42), true
+            oc = oc + 1
+            local testB = pill(scroll, G("Test key", "Проверить ключ"), "bolt", UDim2.fromOffset(170, 32), function()
+                notify(G("Testing...", "Проверяю..."))
+                AI.ask({ { role = "user", text = "Say OK in one word." } }, function(ok, res)
+                    notify(ok and (G("Works: ", "Работает: ") .. tostring(res)) or (G("Failed: ", "Ошибка: ") .. tostring(res)))
+                end)
+            end)
+            testB.b.LayoutOrder = oc
+        end
 
         section(G("Security", "Безопасность"))
         local bg = grid()
@@ -3877,24 +4273,6 @@ local ok_blk19, err_blk19 = pcall(function()
             end)
             rb.b.LayoutOrder = oc
         end
-
-        section(G("Discord status webhook", "Статус-вебхук Discord"))
-        local dHint = txt(scroll, G("Posts an embed to your Discord channel when someone injects (name, status, detect status, version). No personal data is sent. Set CFG.Discord.WebhookUrl in the script.",
-            "Отправляет эмбед в твой канал Discord при каждом Inject (название, статус, детект, версия). Личные данные не отправляются. Укажи CFG.Discord.WebhookUrl в скрипте."), 11, C.sub)
-        oc = oc + 1
-        dHint.LayoutOrder, dHint.Size, dHint.TextWrapped = oc, UDim2.new(1, -6, 0, 42), true
-        oc = oc + 1
-        local dState = txt(scroll, DISC.enabled() and G("Webhook: configured ✓", "Вебхук: настроен ✓") or G("Webhook: not set (CFG.Discord.WebhookUrl is empty)", "Вебхук: не задан (CFG.Discord.WebhookUrl пуст)"),
-            12, DISC.enabled() and C.ok or C.sub, Enum.Font.GothamMedium)
-        dState.LayoutOrder, dState.Size = oc, UDim2.new(1, -6, 0, 20)
-        oc = oc + 1
-        local testB = pill(scroll, G("Send test message", "Отправить тест"), "bolt", UDim2.fromOffset(190, 32), function()
-            if not DISC.enabled() then notify(G("Set CFG.Discord.WebhookUrl first", "Сначала укажи CFG.Discord.WebhookUrl")) return end
-            DISC.post("test")
-            notify(G("Sent (check your Discord channel)", "Отправлено (проверь канал Discord)"))
-        end)
-        testB.b.LayoutOrder = oc
-    end
 
         section(G("Branding", "Брендинг"))
         oc = oc + 1
@@ -3947,12 +4325,12 @@ local ok_blk19, err_blk19 = pcall(function()
         rst.b.LayoutOrder = 4
     end
     genv.__SM1LER_applyFps = applyFps
-end) if not ok_blk19 then warn("[blk19] " .. tostring(err_blk19)) end
+end) if not ok then warn("[blk19] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- ACCOUNT
 ----------------------------------------------------------------------
-local ok_blk20, err_blk20 = pcall(function()
+;(function() local ok, err = pcall(function()
     local accountPage = addPage("Account", "user")
     header(accountPage, "Account")
     local card = new("Frame", { Parent = accountPage, Position = UDim2.fromOffset(0, 50), Size = UDim2.new(1, 0, 0, 130), BackgroundColor3 = C.panel }, { round(14), stroke() })
@@ -3989,7 +4367,7 @@ local ok_blk20, err_blk20 = pcall(function()
     copyBtn("Place ID", function() return game.PlaceId end, 1)
     copyBtn("Job ID", function() return game.JobId end, 2)
     copyBtn("User ID", function() return LP.UserId end, 3)
-end) if not ok_blk20 then warn("[blk20] " .. tostring(err_blk20)) end
+end) if not ok then warn("[blk20] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- Quick tour
@@ -4042,7 +4420,7 @@ bind(UIS.InputBegan, function(input, gpe)
     if not gpe and input.KeyCode == CFG.ToggleKey then setOpen(not open) end
 end)
 
-local ok_blk21, err_blk21 = pcall(function()
+;(function() local ok, err = pcall(function()
     local dragging, target, startMouse, startPos
     local function isPointer(i) return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch end
     bind(topBtn.InputBegan, function(input)
@@ -4066,7 +4444,7 @@ local ok_blk21, err_blk21 = pcall(function()
         end
     end)
     bind(UIS.InputEnded, function(input) if isPointer(input) then dragging = false end end)
-end) if not ok_blk21 then warn("[blk21] " .. tostring(err_blk21)) end
+end) if not ok then warn("[blk21] " .. tostring(err)) end end)()
 if workspace.CurrentCamera then
     bind(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), function() if open then uiScale.Scale = targetScale() end end)
 end
@@ -4079,7 +4457,7 @@ end
 ----------------------------------------------------------------------
 local PALS, curPal = {}, "default"
 local PAL = { keys = { "bg", "panel", "item", "hover", "line", "text", "sub", "white", "ok", "warn", "err", "info" } }
-local ok_blk22, err_blk22 = pcall(function()
+;(function() local ok, err = pcall(function()
     local base = {}
     for k, v in pairs(C) do base[k] = v end
     PALS.default = base
@@ -4087,7 +4465,7 @@ local ok_blk22, err_blk22 = pcall(function()
     -- Volt: flat neutral greys (#111111 / #171717 / #242424 / #262626, text #cccccc)
     PALS.volt = { bg = rgb(17, 17, 17), panel = rgb(23, 23, 23), item = rgb(36, 36, 36), hover = rgb(52, 52, 52), line = rgb(38, 38, 38),
         text = rgb(204, 204, 204), sub = rgb(163, 163, 163), white = rgb(229, 229, 229), black = base.black, ok = rgb(16, 185, 129), warn = rgb(234, 179, 8), err = rgb(239, 68, 68), info = base.info }
-end) if not ok_blk22 then warn("[blk22] " .. tostring(err_blk22)) end
+end) if not ok then warn("[blk22] " .. tostring(err)) end end)()
 -- full colour table of a palette; "custom" = TH.palCustom on top of the default one (every colour kept unique)
 local function palTarget(name)
     if name ~= "custom" then return PALS[name] or PALS.default end
@@ -4164,7 +4542,7 @@ end
 -- INTERFACE STYLE: corner radius, border width, font family, text size
 ----------------------------------------------------------------------
 local STY = { fonts = { "Gotham", "Builder Sans", "Source Sans", "Ubuntu", "Roboto", "Nunito" } }
-local ok_blk23, err_blk23 = pcall(function()
+;(function() local ok, err = pcall(function()
     local FAM = {
         ["Builder Sans"] = { Gotham = "BuilderSans", GothamMedium = "BuilderSansMedium", GothamSemibold = "BuilderSansMedium", GothamBold = "BuilderSansBold", GothamBlack = "BuilderSansExtraBold" },
         ["Source Sans"] = { Gotham = "SourceSans", GothamMedium = "SourceSansSemibold", GothamSemibold = "SourceSansSemibold", GothamBold = "SourceSansBold", GothamBlack = "SourceSansBold" },
@@ -4227,13 +4605,13 @@ local ok_blk23, err_blk23 = pcall(function()
             pcall(styleOne, d)
         end)
     end)
-end) if not ok_blk23 then warn("[blk23] " .. tostring(err_blk23)) end
+end) if not ok then warn("[blk23] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- VOLT theme extras: silver light sweeps running along the window edges
 ----------------------------------------------------------------------
 local VT = { on = false }
-local ok_blk24, err_blk24 = pcall(function()
+;(function() local ok, err = pcall(function()
     local function mkBar(pos)
         local holder = new("Frame", { Parent = content, Position = pos, Size = UDim2.new(1, 0, 0, 2), BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 17, Visible = false })
         local bar = new("Frame", { Parent = holder, Size = UDim2.fromOffset(180, 2), BackgroundColor3 = Color3.fromRGB(240, 240, 246), BorderSizePixel = 0, ZIndex = 17 },
@@ -4261,13 +4639,13 @@ local ok_blk24, err_blk24 = pcall(function()
         VT.on = on
         topH.Visible, botH.Visible = on, on
     end
-end) if not ok_blk24 then warn("[blk24] " .. tostring(err_blk24)) end
+end) if not ok then warn("[blk24] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- NEW YEAR theme extras: garland, countdown plaque, falling snowflakes, fireworks
 ----------------------------------------------------------------------
 local NY = { on = false, was = false }
-local ok_blk25, err_blk25 = pcall(function()
+;(function() local ok, err = pcall(function()
     local W = WIN_W
     local bulbs, ptxt, nyText = {}, nil, nil
     local COLS = { Color3.fromRGB(255, 70, 85), Color3.fromRGB(255, 205, 80), Color3.fromRGB(90, 220, 130), Color3.fromRGB(90, 170, 255), Color3.fromRGB(255, 120, 200) }
@@ -4372,6 +4750,7 @@ local ok_blk25, err_blk25 = pcall(function()
         if not win.Visible then return end
         local fx = new("Frame", { Parent = content, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 40, ClipsDescendants = true, BorderSizePixel = 0 }, { round(18) })
         task.spawn(function()
+        local ok_spawn7, err_spawn7 = pcall(function()
             for _ = 1, 4 do
                 local cx, cy = math.random(120, 500), math.random(60, 200)
                 local base = COLS[math.random(#COLS)]
@@ -4385,7 +4764,10 @@ local ok_blk25, err_blk25 = pcall(function()
             end
             task.wait(1.1)
             fx:Destroy()
+        
         end)
+        if not ok_spawn7 then warn("[spawn7] " .. tostring(err_spawn7)) end
+    end)
     end
 
     function NY.set(on)
@@ -4396,10 +4778,10 @@ local ok_blk25, err_blk25 = pcall(function()
         if on and not NY.was then NY.burst() end
         NY.was = on
     end
-end) if not ok_blk25 then warn("[blk25] " .. tostring(err_blk25)) end
+end) if not ok then warn("[blk25] " .. tostring(err)) end end)()
 
 local applyTheme, resolveImage
-local ok_blk26, err_blk26 = pcall(function()
+;(function() local ok, err = pcall(function()
 local themePage = addPage("Theme", "filter")
 local imgMsgLbl
 local lastPanelAlpha = 0
@@ -5028,9 +5410,13 @@ do
         local loadP = pill(ir, "Load", "check", UDim2.fromOffset(92, 34), function()
             TH.image = ibox.Text
             task.spawn(function()
+        local ok_spawn8, err_spawn8 = pcall(function()
                 resolveImage(TH.image)
                 commit()
-            end)
+            
+        end)
+        if not ok_spawn8 then warn("[spawn8] " .. tostring(err_spawn8)) end
+    end)
         end, true)
         loadP.b.AnchorPoint, loadP.b.Position = Vector2.new(1, 0.5), UDim2.new(1, -8, 0.5, 0)
         local mr = rowF("imgMsg", nil, 30)
@@ -5177,10 +5563,10 @@ do
     placeRight(resetP.b, 2)
 end
 
-end) if not ok_blk26 then warn("[blk26] " .. tostring(err_blk26)) end
+end) if not ok then warn("[blk26] " .. tostring(err)) end end)()
 
 -- INJECT status bar on Home ----------------------------------------------
-local ok_blk27, err_blk27 = pcall(function()
+;(function() local ok, err = pcall(function()
     local pg = pages.Home
     local bar = new("Frame", { Parent = pg, AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = C.panel }, { round(14), stroke() })
     local dot = new("Frame", { Parent = bar, Position = UDim2.fromOffset(16, 18), Size = UDim2.fromOffset(10, 10), BackgroundColor3 = C.err, BorderSizePixel = 0 }, { round(5) })
@@ -5200,12 +5586,12 @@ local ok_blk27, err_blk27 = pcall(function()
         else TBAR.lbl.Text, TBAR.dot.BackgroundColor3 = G("Not injected", "Не подключён"), C.err end
     end
     refreshInjectUI()
-end) if not ok_blk27 then warn("[blk27] " .. tostring(err_blk27)) end
+end) if not ok then warn("[blk27] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- STREAMER ENGINE (hides your real name in every GUI you can reach)
 ----------------------------------------------------------------------
-local ok_blk28, err_blk28 = pcall(function()
+;(function() local ok, err = pcall(function()
     local function replaceWord(text, real, fake)
         if real == "" or not string.find(text, real, 1, true) then return text end
         local out, i, n = {}, 1, #text
@@ -5280,6 +5666,7 @@ local ok_blk28, err_blk28 = pcall(function()
             for _, c in ipairs(list) do
                 Stream.watch[#Stream.watch + 1] = c.DescendantAdded:Connect(function(d) if isText(d) then hook(d) end end)
                 task.spawn(function()
+        local ok_spawn9, err_spawn9 = pcall(function()
                     local k = 0
                     for _, d in ipairs(c:GetDescendants()) do
                         if not Stream.active then return end
@@ -5287,7 +5674,10 @@ local ok_blk28, err_blk28 = pcall(function()
                         k = k + 1
                         if k % 300 == 0 then task.wait() end
                     end
-                end)
+                
+        end)
+        if not ok_spawn9 then warn("[spawn9] " .. tostring(err_spawn9)) end
+    end)
             end
             addLog("INFO", "Streamer mode ON - shown as " .. Stream.display .. " (@" .. Stream.handle .. ")")
         else
@@ -5318,12 +5708,12 @@ local ok_blk28, err_blk28 = pcall(function()
             setHumanoid(true)
         end
     end)
-end) if not ok_blk28 then warn("[blk28] " .. tostring(err_blk28)) end
+end) if not ok then warn("[blk28] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- INFO PAGE
 ----------------------------------------------------------------------
-local ok_blk29, err_blk29 = pcall(function()
+;(function() local ok, err = pcall(function()
     local pg = addPage("Info", "info")
     header(pg, "Info")
     local scroll = new("ScrollingFrame", { Parent = pg, Position = UDim2.fromOffset(0, 46), Size = UDim2.new(1, 0, 1, -46), BackgroundTransparency = 1, BorderSizePixel = 0,
@@ -5426,7 +5816,7 @@ local ok_blk29, err_blk29 = pcall(function()
             task.wait(1)
         end
     end)
-end) if not ok_blk29 then warn("[blk29] " .. tostring(err_blk29)) end
+end) if not ok then warn("[blk29] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- KEY SYSTEM · LOADER · INTRO · EXPIRY
@@ -5800,8 +6190,12 @@ local function openGate(mode, message)
             info.Text = G("Stay on this screen while the scan runs.", "Оставайся на этом экране, пока идёт проверка.")
             count.Text = tostring(st.secs)
             task.spawn(function()
+        local ok_spawn10, err_spawn10 = pcall(function()
                 compOk = UPD.ensure(function(_, msg) if msg then compMsg = msg end end)
-            end)
+            
+        end)
+        if not ok_spawn10 then warn("[spawn10] " .. tostring(err_spawn10)) end
+    end)
         end, true)
         startP.b.AnchorPoint, startP.b.Position = Vector2.new(0.5, 0), UDim2.new(0.5, 0, 0, 112)
         return { update = function(dt)
@@ -5868,6 +6262,7 @@ local function openGate(mode, message)
             busy = true
             local clickT = os.clock()
             task.spawn(function()
+        local ok_spawn11, err_spawn11 = pcall(function()
                 lbl.Text = G("Analyzing...", "Анализ...")
                 for k = 1, 6 do
                     cb.Text = ({ "·", "··", "···" })[(k - 1) % 3 + 1]
@@ -5897,7 +6292,10 @@ local function openGate(mode, message)
                     shownAt, moves0, realInputAt, hoverSeen = os.clock(), mouseMoves, 0, false
                     busy = false
                 end
-            end)
+            
+        end)
+        if not ok_spawn11 then warn("[spawn11] " .. tostring(err_spawn11)) end
+    end)
         end)
         return {}
     end
@@ -6096,6 +6494,7 @@ local function expiryPopup()
     local renew = pill(row, "Renew key", "refresh", UDim2.fromOffset(170, 40), function() close() openGate("renew") end, true)
     renew.b.LayoutOrder = 2
     task.spawn(function()
+        local ok_spawn12, err_spawn12 = pcall(function()
         while dim.Parent and alive do
             local left = KEY.expires - nowT()
             body.Text = G("Time left: ", "Осталось: ") .. fmtDur(left) .. G(
@@ -6103,11 +6502,14 @@ local function expiryPopup()
                 ".\nМожно продолжить работу до конца или обновить ключ сейчас.")
             task.wait(1)
         end
+    
+        end)
+        if not ok_spawn12 then warn("[spawn12] " .. tostring(err_spawn12)) end
     end)
 end
 
 -- key card on the Account page
-local ok_blk30, err_blk30 = pcall(function()
+;(function() local ok, err = pcall(function()
     local pg = pages.Account
     local card = new("Frame", { Parent = pg, Position = UDim2.fromOffset(0, 238), Size = UDim2.new(1, 0, 0, 84), BackgroundColor3 = C.panel }, { round(14), stroke() })
     local kt = txt(card, "KEY", 11, C.sub, Enum.Font.GothamBold)
@@ -6122,7 +6524,7 @@ local ok_blk30, err_blk30 = pcall(function()
         lockApp(G("Key removed. Get or enter a new key.", "Ключ удалён. Получи или введи новый."))
     end)
     f.b.AnchorPoint, f.b.Position = Vector2.new(1, 1), UDim2.new(1, -10, 1, -9)
-end) if not ok_blk30 then warn("[blk30] " .. tostring(err_blk30)) end
+end) if not ok then warn("[blk30] " .. tostring(err)) end end)()
 
 -- chip shown during the last minutes
 GT.chip = new("TextButton", { Parent = gui, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 52), Size = UDim2.fromOffset(118, 30),
@@ -6136,10 +6538,10 @@ bind(GT.chip.MouseButton1Click, expiryPopup)
 GT.reopen = new("TextButton", { Parent = gui, AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -12, 1, -12), Size = UDim2.fromOffset(132, 34),
     BackgroundColor3 = Color3.fromRGB(6, 6, 8), Text = "", AutoButtonColor = false, Visible = false, ZIndex = 120 },
     { new("UICorner", { CornerRadius = UDim.new(0, 17) }), neonStroke(1.5, 60) })
-local ok_blk31, err_blk31 = pcall(function()
+;(function() local ok, err = pcall(function()
     local t = txt(GT.reopen, G("🔑 Key system", "🔑 Ключ-система"), 12, C.white, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
     t.Size = UDim2.fromScale(1, 1)
-end) if not ok_blk31 then warn("[blk31] " .. tostring(err_blk31)) end
+end) if not ok then warn("[blk31] " .. tostring(err)) end end)()
 bind(GT.reopen.MouseButton1Click, function()
     if GT.root and GT.root.Parent then GT.root.Visible = true GT.reopen.Visible = false end
 end)
@@ -6208,7 +6610,7 @@ end)
 -- HUD watermark bar (time / FPS / ping / players, always on screen)
 ----------------------------------------------------------------------
 -- (hudBar is forward-declared at the top of the file)
-local ok_blk32, err_blk32 = pcall(function()
+;(function() local ok, err = pcall(function()
     local bar = new("Frame", {
         Parent = gui, AnchorPoint = Vector2.new(0, 0), Position = UDim2.fromOffset(8, 46),
         Size = UDim2.fromOffset(372, 40), BackgroundColor3 = C.bg, Visible = S.hud, ZIndex = 80, ClipsDescendants = true, Active = true,
@@ -6286,7 +6688,7 @@ local ok_blk32, err_blk32 = pcall(function()
             task.wait(0.5)
         end
     end)
-end) if not ok_blk32 then warn("[blk32] " .. tostring(err_blk32)) end
+end) if not ok then warn("[blk32] " .. tostring(err)) end end)()
 
 ----------------------------------------------------------------------
 -- Boot
@@ -6322,13 +6724,19 @@ task.spawn(function()
         if okU and launched then alive = false return end
     end
     for _, n in ipairs(FX.neon) do n.g.Enabled = S.neon ~= false end
-    if TH.mode == "image" and TH.image ~= "" then task.spawn(function() resolveImage(TH.image) applyTheme() end) end
+    if TH.mode == "image" and TH.image ~= "" then task.spawn(function()
+        local ok_spawn13, err_spawn13 = pcall(function() resolveImage(TH.image) applyTheme() 
+        end)
+        if not ok_spawn13 then warn("[spawn13] " .. tostring(err_spawn13)) end
+    end) end
     pcall(applyTheme)
     if S.streamer then pcall(applyStreamer, true) end
 
     step(G("Checking key", "Проверка ключа"), 0.6, 0.3)
     local valid, exp, reason = false, nil, nil
-    if type(DB.key) == "string" then
+    if isOwner() then
+        valid, exp, DB.planTier, DB.key = true, math.huge, "owner", "OWNER"
+    elseif type(DB.key) == "string" then
         local ok, a, formatted, tier = validateKey(DB.key)
         if ok then valid, exp, DB.key = true, a, formatted
             if tier then DB.planTier = tier end
